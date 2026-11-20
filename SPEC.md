@@ -21,7 +21,7 @@ Decided with the owner on 20 Nov 2026. Each later stage builds on this.
 
 ## World
 
-- **One connected night world with set spots and smooth camera glides** between them, about every 10 min (a knob on the panel). Entering an interior ends with a rain-blur fade.
+- **One connected night world with set spots and smooth camera glides** between them when you switch (it stays put otherwise). Entering an interior ends with a rain-blur fade.
   - **Residential:** British terraced street + **house window** interior (indoor acoustics: muffled outside, crisp taps on the glass).
   - **City:** shopfronts and neon, traffic on by default, plus a **parked car** interior (rain drumming on the roof).
   - **Alley:** brick walls, one cold lamp, a sheltered doorway.
