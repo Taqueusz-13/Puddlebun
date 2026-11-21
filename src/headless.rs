@@ -1,11 +1,14 @@
 //! Headless mode: render frames (and optionally the audio) without a window.
 //! Used for screenshots and for testing on machines without a display.
 //!
-//!   puddlebun --screenshot shot.png --size 1920x1080 --frames 90 --shot 2
-//!   puddlebun --audio rain.wav --seconds 15
+//!   puddlebun --screenshot window.png --size 1920x1080 --frames 90
+//!   puddlebun --screenshot street.png --shot 2
+//!   puddlebun --audio rain.wav --seconds 15 --open
 
-use crate::audio::{self, AudioEngine, AudioShared};
-use crate::camera::CameraRig;
+use crate::audio::{self, AudioEngine, AudioMsg, AudioShared};
+use crate::camera::{self, CameraRig, HeadInput};
+use crate::room::RoomSim;
+use crate::scene::SceneKind;
 use crate::gpu::Gpu;
 use crate::render::{util, FrameData, Renderer};
 use crate::settings::Settings;
@@ -100,6 +103,20 @@ pub fn run(args: &Args) -> Result<()> {
     if let Some(e) = args.exposure {
         settings.exposure_ev = e;
     }
+    if let Some(v) = args.wind {
+        settings.wind_speed = v;
+    }
+    if let Some(v) = args.stylise {
+        settings.stylise = v;
+    }
+    if let Some(v) = args.muffle {
+        settings.muffle = v;
+    }
+    if let Some(v) = args.city_life {
+        settings.city_life = v;
+    }
+    settings.window_open = args.open;
+    settings.sanitize();
     let (w, h) = args.size;
     let instance = Gpu::instance(None);
     let gpu = pollster::block_on(Gpu::new(instance, None))?;
@@ -109,7 +126,16 @@ pub fn run(args: &Args) -> Result<()> {
 
     let mut weather = Weather::new(&settings);
     let mut cam = CameraRig::new();
-    cam.jump_to(args.shot);
+    let spot = if args.spot == camera::SPOT_HIGH_RISE { camera::SPOT_NEON_WINDOW } else { args.spot.min(camera::SPOT_COUNT - 1) };
+    let scene = camera::spot_scene(spot);
+    let interior = scene == SceneKind::City;
+    let mut room = RoomSim::new(renderer.window_geom(SceneKind::City).context("the city has no window")?);
+    if interior {
+        cam.sit_at_window(room.geom);
+        room.prewarm(&weather.state, &settings);
+    } else {
+        cam.jump_to((spot - 2) as usize);
+    }
 
     let fps = 30.0f32;
     let dt = 1.0 / fps;
@@ -118,7 +144,7 @@ pub fn run(args: &Args) -> Result<()> {
     // offline audio engine fed by the same GPU impacts
     let sr = 48_000u32;
     let shared = Arc::new(AudioShared::default());
-    let (mut producer, consumer) = rtrb::RingBuffer::new(1 << 16);
+    let (mut producer, consumer) = rtrb::RingBuffer::<AudioMsg>::new(1 << 16);
     let mut engine = AudioEngine::new(sr as f32, consumer, shared.clone());
     let mut left = Vec::new();
     let mut right = Vec::new();
@@ -130,24 +156,43 @@ pub fn run(args: &Args) -> Result<()> {
     for i in 0..frames {
         let t = args.time + i as f32 * dt;
         weather.update(dt, &settings);
-        let mut cs = cam.update(dt, &Default::default(), 1e9, false, None);
+        if interior {
+            room.update(dt, t, &weather.state, &settings);
+        }
+        let mut cs = cam.update(dt, &Default::default(), &HeadInput::default(), 1e9, false, None);
         if let Some(c) = args.cam {
             let pos = glam::Vec3::new(c[0], c[1], c[2]);
             cs.pos = pos;
             cs.forward = (glam::Vec3::new(c[3], c[4], c[5]) - pos).normalize();
         }
-        let fd = FrameData { camera: cs, time: t, dt, frame_index: i, weather: &weather.state, settings: &settings };
+        let fd = FrameData {
+            camera: cs,
+            time: t,
+            dt,
+            frame_index: i,
+            weather: &weather.state,
+            settings: &settings,
+            scene,
+            room: if interior { Some(room.state()) } else { None },
+            fade: 0.0,
+            cpu_splashes: if interior { room.splashes() } else { &[] },
+            drips: if interior { room.drips() } else { &[] },
+        };
         renderer.render(&fd, &view, None);
         if args.audio.is_some() {
-            shared.intensity.set(weather.state.intensity);
-            shared.wind.set(weather.state.wind.length());
-            shared.puddle.set(weather.state.puddle_level);
+            audio::update_shared(&shared, &settings, &weather.state, scene, interior, room.open(), 0.0);
             for imp in renderer.readback.wait_all(&gpu.device) {
                 total_impacts += imp.total as u64;
                 let voices = audio::spatialise(&imp.events, &cs, sr as f32, dt, &mut rng);
                 total_voiced += voices.len() as u64;
                 for v in voices {
-                    let _ = producer.push(v);
+                    let _ = producer.push(AudioMsg::Impact(v));
+                }
+            }
+            if interior {
+                for m in room.audio_msgs(&cs, sr as f32, dt, &mut rng) {
+                    total_voiced += 1;
+                    let _ = producer.push(m);
                 }
             }
             let n = (sr as f32 * dt) as usize;
@@ -159,14 +204,19 @@ pub fn run(args: &Args) -> Result<()> {
             let _ = renderer.readback.wait_all(&gpu.device);
         }
         if i % 10 == 0 {
-            log::info!("frame {i}/{frames} ({} drops, {:.1}s elapsed)", renderer.stats.active_drops, started.elapsed().as_secs_f32());
+            log::info!(
+                "frame {i}/{frames} ({} drops, {} on the glass, {:.1}s elapsed)",
+                renderer.stats.active_drops,
+                if interior { room.glass.drop_count() } else { 0 },
+                started.elapsed().as_secs_f32()
+            );
         }
     }
 
     if let Some(path) = &args.screenshot {
         let img = read_texture(&gpu.device, &gpu.queue, &tex, format)?;
         save_png(path, &img)?;
-        println!("saved {} ({}x{}, shot {}: {})", path.display(), w, h, args.shot, cam.shots[args.shot % cam.shots.len()].name);
+        println!("saved {} ({}x{}, {})", path.display(), w, h, camera::spot_names()[spot as usize]);
     }
     if let Some(path) = &args.audio {
         audio::write_wav(path, sr, &left, &right)?;

@@ -1,6 +1,8 @@
 //! The renderer: owns every GPU resource and records one frame:
-//! compute (rain + ripples) → reflection pass → main pass → bloom/tonemap → UI.
+//! compute (rain + ripples) → reflection pass → outside pass →
+//! [glass blur → room + glass] → bloom/tonemap/stylise → UI.
 
+pub mod glass;
 pub mod post;
 pub mod rain;
 pub mod readback;
@@ -8,7 +10,8 @@ pub mod ripple;
 pub mod util;
 
 use crate::camera::CameraState;
-use crate::scene::{self, Street};
+use crate::city::{self, WindowGeom};
+use crate::scene::{self, SceneKind, StaticLight, Tint, World};
 use crate::settings::Settings;
 use crate::weather::{self, WeatherState};
 use crate::wgpu;
@@ -20,6 +23,7 @@ use wgpu::util::DeviceExt;
 pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 pub const MAX_LIGHTS: usize = 64;
+const MAX_LAMPS: usize = 40;
 
 /// Must match `Frame` in common.wgsl.
 #[repr(C)]
@@ -41,6 +45,10 @@ pub struct FrameUniform {
     pub ripple: [f32; 4],
     pub counts: [u32; 4],
     pub misc: [f32; 4],
+    pub scene: [u32; 4],
+    pub room: [f32; 4],
+    pub win_a: [f32; 4],
+    pub win_b: [f32; 4],
 }
 
 #[repr(C)]
@@ -51,6 +59,13 @@ pub struct GpuLight {
     pub dir: [f32; 4],
 }
 
+/// State of the window/room when looking out from inside.
+pub struct RoomState<'a> {
+    pub raise: f32,
+    pub sill_wet: f32,
+    pub glass: &'a crate::glass::GlassSim,
+}
+
 /// Everything needed to draw one frame.
 pub struct FrameData<'a> {
     pub camera: CameraState,
@@ -59,6 +74,12 @@ pub struct FrameData<'a> {
     pub frame_index: u32,
     pub weather: &'a WeatherState,
     pub settings: &'a Settings,
+    pub scene: SceneKind,
+    pub room: Option<RoomState<'a>>,
+    pub fade: f32,
+    /// first CPU_SPLASHES_OUTSIDE are outside, the rest inside the room
+    pub cpu_splashes: &'a [rain::GpuSplash],
+    pub drips: &'a [rain::GpuDrop],
 }
 
 pub struct EguiDraw<'a> {
@@ -77,11 +98,47 @@ pub struct RenderStats {
 }
 
 struct Targets {
-    hdr: wgpu::TextureView,
+    outside: wgpu::Texture,
+    outside_view: wgpu::TextureView,
+    hdr: wgpu::Texture,
+    hdr_view: wgpu::TextureView,
     depth: wgpu::TextureView,
     refl: wgpu::TextureView,
     refl_depth: wgpu::TextureView,
     refl_size: (u32, u32),
+}
+
+struct GpuMesh {
+    vbuf: wgpu::Buffer,
+    ibuf: wgpu::Buffer,
+    count: u32,
+}
+
+impl GpuMesh {
+    fn new(device: &wgpu::Device, m: &scene::MeshBuilder, label: &str) -> Self {
+        let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytemuck::cast_slice(&m.vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytemuck::cast_slice(&m.indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        Self { vbuf, ibuf, count: m.indices.len() as u32 }
+    }
+    fn draw(&self, pass: &mut wgpu::RenderPass) {
+        pass.set_vertex_buffer(0, self.vbuf.slice(..));
+        pass.set_index_buffer(self.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..self.count, 0, 0..1);
+    }
+}
+
+struct GpuWorld {
+    mesh: GpuMesh,
+    room_mesh: Option<GpuMesh>,
+    world: World,
 }
 
 pub struct Renderer {
@@ -98,9 +155,7 @@ pub struct Renderer {
     scene_bgl: wgpu::BindGroupLayout,
     scene_pipeline: wgpu::RenderPipeline,
     sky_pipeline: wgpu::RenderPipeline,
-    vbuf: wgpu::Buffer,
-    ibuf: wgpu::Buffer,
-    index_count: u32,
+    worlds: Vec<GpuWorld>,
     scene_bg_main: Vec<wgpu::BindGroup>,
     scene_bg_refl: Vec<wgpu::BindGroup>,
     sampler: wgpu::Sampler,
@@ -109,8 +164,8 @@ pub struct Renderer {
     pub rain: rain::Rain,
     pub ripple: ripple::Ripple,
     post: post::Post,
+    glass: glass::GlassGpu,
     pub readback: readback::Readback,
-    street: Street,
     prev_view_proj: Mat4,
     reflection_scale: f32,
     pub stats: RenderStats,
@@ -157,7 +212,11 @@ impl Renderer {
             label: Some("scene bgl"),
             entries: &[texture_entry(0, f), sampler_entry(1, f), storage_entry(2, f, true)],
         });
-        let scene_module = shader(&device, "scene", &[COMMON_WGSL, WORLD_WGSL, include_str!("../shaders/scene.wgsl")]);
+        let scene_module = shader(
+            &device,
+            "scene",
+            &[COMMON_WGSL, WORLD_WGSL, include_str!("../shaders/scene.wgsl"), include_str!("../shaders/city.wgsl")],
+        );
         let scene_layout = layout(&device, "scene layout", &[&frame_bgl, &scene_bgl]);
         let vertex_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<scene::Vertex>() as u64,
@@ -191,24 +250,19 @@ impl Renderer {
             Some(depth_state(false, wgpu::CompareFunction::GreaterEqual)),
         );
 
-        let street = scene::build_street();
-        let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("street vertices"),
-            contents: bytemuck::cast_slice(&street.mesh.vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("street indices"),
-            contents: bytemuck::cast_slice(&street.mesh.indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-        let index_count = street.mesh.indices.len() as u32;
-        log::info!("street: {} vertices, {} triangles, {} lamps", street.mesh.vertices.len(), index_count / 3, street.lamps.len());
+        let mut worlds = Vec::new();
+        for w in [scene::build_street(), city::build_city()] {
+            let mesh = GpuMesh::new(&device, &w.mesh, "world mesh");
+            let room_mesh = w.room.as_ref().map(|r| GpuMesh::new(&device, &r.mesh, "room mesh"));
+            log::info!("{:?}: {} vertices, {} triangles, {} lights", w.kind, w.mesh.vertices.len(), w.mesh.indices.len() / 3, w.lights.len());
+            worlds.push(GpuWorld { mesh, room_mesh, world: w });
+        }
 
         let ripple = ripple::Ripple::new(&device);
         let rain = rain::Rain::new(&device, &frame_bgl, &ripple.impulses, settings.max_particles);
         let readback = readback::Readback::new(&device);
         let post = post::Post::new(&device, output_format);
+        let glass = glass::GlassGpu::new(&device, &frame_bgl);
         let sampler = linear_sampler(&device, wgpu::AddressMode::ClampToEdge);
         let (_dt, dummy) = texture(&device, "dummy", 1, 1, HDR_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING);
 
@@ -227,9 +281,7 @@ impl Renderer {
             scene_bgl,
             scene_pipeline,
             sky_pipeline,
-            vbuf,
-            ibuf,
-            index_count,
+            worlds,
             scene_bg_main: Vec::new(),
             scene_bg_refl: Vec::new(),
             sampler,
@@ -238,8 +290,8 @@ impl Renderer {
             rain,
             ripple,
             post,
+            glass,
             readback,
-            street,
             prev_view_proj: Mat4::IDENTITY,
             reflection_scale: settings.reflection_scale,
             stats: RenderStats::default(),
@@ -250,13 +302,14 @@ impl Renderer {
 
     fn make_targets(device: &wgpu::Device, w: u32, h: u32, refl_scale: f32) -> Targets {
         let rt = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
-        let (_a, hdr) = texture(device, "hdr", w, h, HDR_FORMAT, rt);
+        let (outside, outside_view) = texture(device, "outside", w, h, HDR_FORMAT, rt | wgpu::TextureUsages::COPY_SRC);
+        let (hdr, hdr_view) = texture(device, "hdr", w, h, HDR_FORMAT, rt | wgpu::TextureUsages::COPY_DST);
         let (_b, depth) = texture(device, "depth", w, h, DEPTH_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT);
         let rw = ((w as f32 * refl_scale) as u32).max(1);
         let rh = ((h as f32 * refl_scale) as u32).max(1);
         let (_c, refl) = texture(device, "reflection", rw, rh, HDR_FORMAT, rt);
         let (_d, refl_depth) = texture(device, "reflection depth", rw, rh, DEPTH_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT);
-        Targets { hdr, depth, refl, refl_depth, refl_size: (rw, rh) }
+        Targets { outside, outside_view, hdr, hdr_view, depth, refl, refl_depth, refl_size: (rw, rh) }
     }
 
     fn rebuild_size_dependent(&mut self) {
@@ -273,7 +326,8 @@ impl Renderer {
         };
         self.scene_bg_main = (0..2).map(|i| mk(&self.targets.refl, &self.ripple.heights[i])).collect();
         self.scene_bg_refl = (0..2).map(|i| mk(&self.dummy, &self.ripple.heights[i])).collect();
-        self.post.resize(&self.device, &self.targets.hdr, self.width, self.height);
+        self.post.resize(&self.device, &self.targets.hdr_view, &self.targets.outside_view, self.width, self.height);
+        self.glass.rebind(&self.device, &self.targets.outside_view, self.post.blurred_outside());
     }
 
     pub fn resize(&mut self, w: u32, h: u32, reflection_scale: f32) {
@@ -288,59 +342,91 @@ impl Renderer {
         self.rebuild_size_dependent();
     }
 
-    /// Street lamps plus the nearest lit windows, in the GPU format.
-    fn build_lights(&self, f: &FrameData) -> (Vec<GpuLight>, u32) {
-        let s = f.settings;
-        let lamp_rgb = weather::kelvin_to_rgb(s.lamp_kelvin) * s.lamp_intensity * 420.0;
-        let mut lights: Vec<GpuLight> = self
-            .street
-            .lamps
-            .iter()
-            .map(|l| GpuLight {
-                pos: [l.pos.x, l.pos.y, l.pos.z, 38.0],
-                color: [lamp_rgb.x, lamp_rgb.y, lamp_rgb.z, 0.0],
-                dir: [0.0, -1.0, 0.0, 0.2],
-            })
-            .collect();
-        let lamp_count = lights.len() as u32;
-        let cam = f.camera.pos;
-        let warm = weather::kelvin_to_rgb(2700.0);
-        let mut wins: Vec<(f32, GpuLight)> = self
-            .street
-            .windows
-            .iter()
-            .filter(|w| scene::window_is_lit(w.house, w.window, s.window_lights))
-            .filter_map(|w| {
-                let d = w.pos.distance(cam);
-                if d > 55.0 {
-                    return None;
-                }
-                let strength = if w.window == 0 { 2.6 } else { 1.6 };
-                let c = warm * strength;
-                Some((d, GpuLight {
-                    pos: [w.pos.x, w.pos.y, w.pos.z, 9.0],
-                    color: [c.x, c.y, c.z, 1.0],
-                    dir: [w.normal.x, w.normal.y - 0.25, w.normal.z, 0.0],
-                }))
-            })
-            .collect();
-        wins.sort_by(|a, b| a.0.total_cmp(&b.0));
-        for (_, l) in wins.into_iter().take(MAX_LIGHTS - lights.len()) {
-            lights.push(l);
-        }
-        (lights, lamp_count)
+    pub fn window_geom(&self, kind: SceneKind) -> Option<WindowGeom> {
+        self.worlds.iter().find(|w| w.world.kind == kind).and_then(|w| w.world.room.as_ref().map(|r| r.geom))
     }
 
-    fn frame_uniform(&self, cam: &CameraState, f: &FrameData, w: u32, h: u32, reflection: bool, n_lights: u32, lamps: u32, active: u32, prev: Mat4) -> FrameUniform {
+    fn light_color(l: &StaticLight, s: &Settings, time: f32) -> Vec3 {
+        let base = match l.tint {
+            Tint::Fixed => l.color,
+            Tint::StreetLamp => weather::kelvin_to_rgb(s.lamp_kelvin) * s.lamp_intensity * 420.0,
+            Tint::CityLamp => weather::kelvin_to_rgb(4300.0) * s.lamp_intensity * 380.0,
+        };
+        if l.flicker != 0 { base * scene::neon_flicker(l.flicker, time) } else { base }
+    }
+
+    fn to_gpu(l: &StaticLight, c: Vec3) -> GpuLight {
+        GpuLight {
+            pos: [l.pos.x, l.pos.y, l.pos.z, l.radius],
+            color: [c.x, c.y, c.z, l.kind as f32],
+            dir: [l.dir.x, l.dir.y, l.dir.z, l.cos_cut],
+        }
+    }
+
+    /// Nearest lamps/neon first (they light the rain and glow in the mist),
+    /// then fill lights and window spill, then the room lamps.
+    fn build_lights(&self, gw: &GpuWorld, f: &FrameData) -> (Vec<GpuLight>, u32) {
+        let s = f.settings;
+        let cam = f.camera.pos;
+        let w = &gw.world;
+        let mut lamps: Vec<(f32, &StaticLight)> = w.lights.iter().map(|l| (l.pos.distance(cam) - l.radius * 0.5, l)).collect();
+        lamps.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut out: Vec<GpuLight> = lamps.iter().take(MAX_LAMPS).map(|(_, l)| Self::to_gpu(l, Self::light_color(l, s, f.time))).collect();
+        let lamp_count = out.len() as u32;
+        let room_lamps: Vec<&StaticLight> = if f.room.is_some() { w.room.as_ref().map(|r| r.lamps.iter().collect()).unwrap_or_default() } else { Vec::new() };
+        let budget = MAX_LIGHTS - out.len() - room_lamps.len();
+        let mut fills: Vec<(f32, GpuLight)> = w
+            .fill_lights
+            .iter()
+            .filter_map(|l| {
+                let d = l.pos.distance(cam);
+                (d < 70.0).then(|| (d, Self::to_gpu(l, Self::light_color(l, s, f.time))))
+            })
+            .collect();
+        let warm = weather::kelvin_to_rgb(2700.0);
+        for win in w.windows.iter().filter(|w| scene::window_is_lit(w.house, w.window, s.window_lights)) {
+            let d = win.pos.distance(cam);
+            if d > 55.0 {
+                continue;
+            }
+            let c = warm * if win.window == 0 { 2.6 } else { 1.6 };
+            fills.push((d, GpuLight {
+                pos: [win.pos.x, win.pos.y, win.pos.z, 9.0],
+                color: [c.x, c.y, c.z, 1.0],
+                dir: [win.normal.x, win.normal.y - 0.25, win.normal.z, 0.0],
+            }));
+        }
+        fills.sort_by(|a, b| a.0.total_cmp(&b.0));
+        out.extend(fills.into_iter().take(budget).map(|(_, l)| l));
+        for l in room_lamps {
+            out.push(Self::to_gpu(l, l.color));
+        }
+        (out, lamp_count)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn frame_uniform(&self, cam: &CameraState, f: &FrameData, gw: &GpuWorld, w: u32, h: u32, reflection: bool, n_lights: u32, lamps: u32, active: u32, prev: Mat4) -> FrameUniform {
         let aspect = w as f32 / h as f32;
         let vp = cam.proj(aspect) * cam.view();
         let focal = (h as f32 * 0.5) / (cam.fov_y * 0.5).tan();
         let s = f.settings;
         let lamp = weather::kelvin_to_rgb(s.lamp_kelvin);
-        let glow = Vec3::new(1.0, 0.62, 0.4) * 0.034 * s.sky_glow;
+        let glow = gw.world.sky * s.sky_glow;
         let ws = f.weather;
         let right = cam.right();
         let up = cam.up();
+        let (scene_id, interior) = (if gw.world.kind == SceneKind::City { 1 } else { 0 }, f.room.is_some() as u32);
+        let (room, win_a, win_b) = match (&f.room, gw.world.room.as_ref()) {
+            (Some(rs), Some(r)) => {
+                let g = &r.geom;
+                (
+                    [rs.raise, rs.glass.cond, s.stylise, rs.sill_wet],
+                    [g.wall_x, g.z_min, g.z_max, g.y_min],
+                    [g.y_max, g.glass_x, g.sill_top, r.lamps.len() as f32],
+                )
+            }
+            _ => ([0.0, 0.0, s.stylise, 0.0], [0.0; 4], [0.0; 4]),
+        };
         FrameUniform {
             view_proj: vp.to_cols_array_2d(),
             inv_view_proj: vp.inverse().to_cols_array_2d(),
@@ -358,6 +444,10 @@ impl Renderer {
             ripple: [ripple::TEXEL, ripple::RES as f32, ripple::TEXEL * ripple::RES as f32, s.ripple_strength],
             counts: [n_lights, lamps, active, self.rain.max_particles],
             misc: [2f32.powf(s.exposure_ev), s.window_lights, s.bloom, 0.0],
+            scene: [scene_id, interior, 0, 0],
+            room,
+            win_a,
+            win_b,
         }
     }
 
@@ -370,27 +460,48 @@ impl Renderer {
         (want as u32).min(self.rain.max_particles)
     }
 
+    fn color_attachment(view: &wgpu::TextureView, load: wgpu::LoadOp<wgpu::Color>) -> Option<wgpu::RenderPassColorAttachment<'_>> {
+        Some(wgpu::RenderPassColorAttachment { view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load, store: wgpu::StoreOp::Store } })
+    }
+
+    fn depth_attachment(view: &wgpu::TextureView) -> Option<wgpu::RenderPassDepthStencilAttachment<'_>> {
+        Some(wgpu::RenderPassDepthStencilAttachment {
+            view,
+            depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Discard }),
+            stencil_ops: None,
+        })
+    }
+
     /// Records and submits a whole frame into `target`.
     pub fn render(&mut self, f: &FrameData, target: &wgpu::TextureView, egui: Option<EguiDraw>) {
         let (w, h) = (self.width, self.height);
         let cam = f.camera;
         let s = f.settings;
+        let wi = self.worlds.iter().position(|g| g.world.kind == f.scene).unwrap_or(0);
+        let interior = f.room.is_some() && self.worlds[wi].room_mesh.is_some();
 
-        // rain volume: a 28 m box centred a little ahead of the camera
-        let half = 14.0;
+        // rain volume: a 28 m box ahead of the camera. From the window it's a
+        // tighter box between our facade and the one opposite, a bit denser:
+        // nothing further away is visible through the rain anyway.
+        let (half, boost) = if interior { (10.0, 2.2) } else { (14.0, 1.0) };
         let fwd_flat = Vec3::new(cam.forward.x, 0.0, cam.forward.z).normalize_or(Vec3::Z);
-        let center = cam.pos + fwd_flat * 8.0;
+        let mut center = cam.pos + fwd_flat * 8.0;
+        let mut x_limit = 1.0e6;
+        if interior {
+            x_limit = city::C_FACADE;
+            center.x = center.x.min(x_limit - half);
+        }
         let top = (cam.pos.y + 14.0).max(16.0);
         let volume = (2.0 * half) * (2.0 * half) * top;
-        let active = self.active_drops(f.weather, volume);
+        let active = self.active_drops(f.weather, volume * boost);
 
-        let (lights, lamps) = self.build_lights(f);
+        let (lights, lamps) = self.build_lights(&self.worlds[wi], f);
         let n_lights = lights.len() as u32;
         self.queue.write_buffer(&self.lights_buf, 0, bytemuck::cast_slice(&lights));
 
-        let fu = self.frame_uniform(&cam, f, w, h, false, n_lights, lamps, active, self.prev_view_proj);
+        let fu = self.frame_uniform(&cam, f, &self.worlds[wi], w, h, false, n_lights, lamps, active, self.prev_view_proj);
         let (rw, rh) = self.targets.refl_size;
-        let fr = self.frame_uniform(&cam.mirrored(), f, rw, rh, true, n_lights, lamps, active, Mat4::IDENTITY);
+        let fr = self.frame_uniform(&cam.mirrored(), f, &self.worlds[wi], rw, rh, true, n_lights, lamps, active, Mat4::IDENTITY);
         self.queue.write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&fu));
         self.queue.write_buffer(&self.frame_refl_buf, 0, bytemuck::bytes_of(&fr));
         self.prev_view_proj = Mat4::from_cols_array_2d(&fu.view_proj);
@@ -399,17 +510,30 @@ impl Renderer {
         let sim = rain::SimParams {
             box_center: [center.x, 0.0, center.z, half],
             box_y: [0.0, top, s.shutter, f.dt.clamp(0.0, 0.05)],
-            dsd: [lambda, weather::D_MIN_VISIBLE, weather::D_MAX, 0.0],
+            dsd: [lambda, weather::D_MIN_VISIBLE, weather::D_MAX, x_limit],
             counts: [active, scene::hash_u(f.frame_index.wrapping_mul(2_654_435_761)), rain::SPLASH_CAPACITY, rain::AUDIO_CAPACITY],
             audio: [12.0, 0.7, 30.0, 220.0 * s.ripple_strength],
         };
         self.queue.write_buffer(&self.rain.sim_buf, 0, bytemuck::bytes_of(&sim));
         // reset per-frame counters (keep the splash ring head)
         self.queue.write_buffer(&self.rain.counters, 4, bytemuck::cast_slice(&[0u32; 3]));
+        // CPU-driven drips and splashes
+        let n_drips = f.drips.len().min(rain::CPU_DROPS as usize);
+        if n_drips > 0 {
+            self.queue.write_buffer(&self.rain.drops, self.rain.max_particles as u64 * rain::DROP_STRIDE, bytemuck::cast_slice(&f.drips[..n_drips]));
+        }
+        let n_spl = f.cpu_splashes.len().min(rain::CPU_SPLASHES as usize);
+        if n_spl > 0 {
+            self.queue.write_buffer(&self.rain.cpu_splashes, 0, bytemuck::cast_slice(&f.cpu_splashes[..n_spl]));
+        }
+        if let (Some(rs), Some(room)) = (&f.room, self.worlds[wi].world.room.as_ref()) {
+            let lamp = room.lamps.first().map(|l| (l.pos, l.color)).unwrap_or((Vec3::ZERO, Vec3::ZERO));
+            self.glass.upload(&self.queue, rs.glass, &room.geom, rs.raise, f.time, lamp.0, lamp.1);
+        }
 
         let flux = weather::number_flux(f.weather.intensity, 0.3, weather::D_MAX) * 0.8;
         let steps = self.ripple.prepare(&self.queue, f.dt, flux, lambda, s.ripple_strength);
-        self.post.update(&self.queue, 2f32.powf(s.exposure_ev), s.bloom * 0.08, f.time);
+        self.post.update(&self.queue, 2f32.powf(s.exposure_ev), s.bloom * 0.08, f.time, s.stylise, f.fade);
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
         {
@@ -419,22 +543,14 @@ impl Renderer {
         }
         self.readback.encode(&mut encoder, &self.rain.counters, &self.rain.audio_events, f.dt);
         let cur = self.ripple.cur;
+        let gw = &self.worlds[wi];
 
-        // reflection pass (mirrored camera, half resolution)
+        // reflection pass (mirrored camera, reduced resolution)
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("reflection"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.targets.refl,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.targets.refl_depth,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Discard }),
-                    stencil_ops: None,
-                }),
+                color_attachments: &[Self::color_attachment(&self.targets.refl, wgpu::LoadOp::Clear(wgpu::Color::BLACK))],
+                depth_stencil_attachment: Self::depth_attachment(&self.targets.refl_depth),
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
@@ -442,28 +558,17 @@ impl Renderer {
             pass.set_bind_group(0, &self.frame_refl_bg, &[]);
             pass.set_bind_group(1, &self.scene_bg_refl[cur], &[]);
             pass.set_pipeline(&self.scene_pipeline);
-            pass.set_vertex_buffer(0, self.vbuf.slice(..));
-            pass.set_index_buffer(self.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..self.index_count, 0, 0..1);
+            gw.mesh.draw(&mut pass);
             pass.set_pipeline(&self.sky_pipeline);
             pass.draw(0..3, 0..1);
         }
 
-        // main pass
+        // outside pass
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("main"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.targets.hdr,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.targets.depth,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Discard }),
-                    stencil_ops: None,
-                }),
+                label: Some("outside"),
+                color_attachments: &[Self::color_attachment(&self.targets.outside_view, wgpu::LoadOp::Clear(wgpu::Color::BLACK))],
+                depth_stencil_attachment: Self::depth_attachment(&self.targets.depth),
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
@@ -471,12 +576,41 @@ impl Renderer {
             pass.set_bind_group(0, &self.frame_bg, &[]);
             pass.set_bind_group(1, &self.scene_bg_main[cur], &[]);
             pass.set_pipeline(&self.scene_pipeline);
-            pass.set_vertex_buffer(0, self.vbuf.slice(..));
-            pass.set_index_buffer(self.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..self.index_count, 0, 0..1);
+            gw.mesh.draw(&mut pass);
             pass.set_pipeline(&self.sky_pipeline);
             pass.draw(0..3, 0..1);
-            self.rain.draw(&mut pass, &self.frame_bg, active);
+            self.rain.draw(&mut pass, &self.frame_bg, active, n_drips as u32);
+            self.rain.draw_cpu_splashes(&mut pass, &self.frame_bg, 0..(n_spl as u32).min(rain::CPU_SPLASHES_OUTSIDE));
+        }
+
+        if interior {
+            self.post.encode_blur(&mut encoder);
+        }
+        encoder.copy_texture_to_texture(
+            self.targets.outside.as_image_copy(),
+            self.targets.hdr.as_image_copy(),
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+
+        if interior {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("room"),
+                color_attachments: &[Self::color_attachment(&self.targets.hdr_view, wgpu::LoadOp::Load)],
+                depth_stencil_attachment: Self::depth_attachment(&self.targets.depth),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_bind_group(0, &self.frame_bg, &[]);
+            pass.set_bind_group(1, &self.scene_bg_refl[cur], &[]);
+            pass.set_pipeline(&self.scene_pipeline);
+            if let Some(rm) = &gw.room_mesh {
+                rm.draw(&mut pass);
+            }
+            self.glass.draw(&mut pass, &self.frame_bg);
+            if n_spl as u32 > rain::CPU_SPLASHES_OUTSIDE {
+                self.rain.draw_cpu_splashes(&mut pass, &self.frame_bg, rain::CPU_SPLASHES_OUTSIDE..n_spl as u32);
+            }
         }
 
         self.post.encode(&mut encoder, target);
@@ -486,12 +620,7 @@ impl Renderer {
             extra_cmds = e.renderer.update_buffers(&self.device, &self.queue, &mut encoder, e.jobs, e.screen);
             let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("egui"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: e.view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                })],
+                color_attachments: &[Self::color_attachment(e.view, wgpu::LoadOp::Load)],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,

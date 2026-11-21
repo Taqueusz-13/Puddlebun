@@ -1,14 +1,18 @@
 //! Puddlebun — a high-quality rain simulator.
-//! Stage 1: engine core, residential street, rain physics, procedural audio.
+//! Stage 2a: the window over the neon street — glass, head movement,
+//! open-a-crack, muffled indoor audio, city life, the stylise look.
 
 #![allow(clippy::too_many_arguments, clippy::needless_range_loop, clippy::field_reassign_with_default)]
 
 mod app;
 mod audio;
 mod camera;
+mod city;
+mod glass;
 mod gpu;
 mod headless;
 mod render;
+mod room;
 mod scene;
 mod settings;
 mod ui;
@@ -27,12 +31,18 @@ pub struct Args {
     pub size: (u32, u32),
     pub frames: u32,
     pub seconds: f32,
-    pub shot: usize,
+    /// 0 = neon window, 2-7 = street viewpoints
+    pub spot: u32,
     pub particles: Option<u32>,
     pub rain: Option<f32>,
     pub exposure: Option<f32>,
     pub time: f32,
     pub reset_settings: bool,
+    pub open: bool,
+    pub stylise: Option<f32>,
+    pub wind: Option<f32>,
+    pub muffle: Option<f32>,
+    pub city_life: Option<f32>,
     /// custom camera for headless renders: x,y,z,look_x,look_y,look_z
     pub cam: Option<[f32; 6]>,
 }
@@ -45,12 +55,17 @@ impl Default for Args {
             size: (1280, 720),
             frames: 60,
             seconds: 10.0,
-            shot: 0,
+            spot: 0,
             particles: None,
             rain: None,
             exposure: None,
             time: 20.0,
             reset_settings: false,
+            open: false,
+            stylise: None,
+            wind: None,
+            muffle: None,
+            city_life: None,
             cam: None,
         }
     }
@@ -72,13 +87,21 @@ OPTIONS (headless, no window needed):
     --size WxH              resolution (default 1280x720)
     --frames N              frames to simulate before the screenshot (default 60)
     --seconds S             length of the audio render (default 10)
-    --shot K                viewpoint 0-5 (default 0)
+    --spot K                0 = the neon window (default), 2-7 = street viewpoints
+    --shot K                street viewpoint 0-5 (same as --spot 2+K)
+    --open                  open the window a crack
     --rain MMH              rain rate in mm/h
+    --wind MS               wind speed in m/s
+    --stylise X             0 = realistic … 1 = full lo-fi look
+    --muffle X              how muffled the closed window is (0-1)
+    --city-life X           how much city life you hear (0-1)
     --exposure EV           exposure in stops
     --cam x,y,z,lx,ly,lz    custom camera position and look-at point
 
 KEYS:
-    Tab panel · F free-fly · 1-6 viewpoints · N next · M mute · F11 fullscreen · F12 screenshot
+    Tab panel · 1 neon window · 3-8 street views · N next spot · O open/close the window
+    mouse / scroll / W S: move your head and lean in at the window
+    F free-fly (street) · M mute · F11 fullscreen · F12 screenshot · Ctrl+Q quit
 ";
 
 fn parse_args() -> Result<Args> {
@@ -100,7 +123,13 @@ fn parse_args() -> Result<Args> {
             }
             "--frames" => a.frames = val()?.parse()?,
             "--seconds" => a.seconds = val()?.parse()?,
-            "--shot" => a.shot = val()?.parse()?,
+            "--spot" => a.spot = val()?.parse()?,
+            "--shot" => a.spot = 2 + val()?.parse::<u32>()?,
+            "--open" => a.open = true,
+            "--stylise" | "--stylize" => a.stylise = Some(val()?.parse()?),
+            "--wind" => a.wind = Some(val()?.parse()?),
+            "--muffle" => a.muffle = Some(val()?.parse()?),
+            "--city-life" => a.city_life = Some(val()?.parse()?),
             "--particles" => a.particles = Some(val()?.parse()?),
             "--rain" => a.rain = Some(val()?.parse()?),
             "--exposure" => a.exposure = Some(val()?.parse()?),

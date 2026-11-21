@@ -4,9 +4,16 @@
 //!   simulation and voiced individually (surface-dependent synthesis).
 //! * Everything further away is a statistical "bed" driven by the same rain
 //!   rate, wind and puddle level.
+//! * Inside the room, the outdoor mix is heard through the glass (muffled,
+//!   leaking in through the crack when it's open), next to the room's own
+//!   sounds: drops tapping the pane, spatter on the sill, the radiator.
+//! * City life (wet tyres, the el-train, a far siren) comes and goes.
 
+pub mod bed;
+pub mod city;
 pub mod dsp;
 pub mod engine;
+pub mod room;
 
 use crate::camera::CameraState;
 use crate::render::rain::GpuImpact;
@@ -23,6 +30,12 @@ pub const SURF_PUDDLE: u8 = 1;
 pub const SURF_PAVE: u8 = 2;
 pub const SURF_ROOF: u8 = 3;
 pub const SURF_GARDEN: u8 = 4;
+pub const SURF_METAL: u8 = 5;
+pub const SURF_GLASS: u8 = 6;
+pub const SURF_AWNING: u8 = 7;
+// audio-only surfaces
+pub const SURF_WOOD: u8 = 9;
+pub const SURF_STONE: u8 = 10;
 
 /// f32 stored in an AtomicU32.
 #[derive(Default)]
@@ -49,8 +62,20 @@ pub struct AudioShared {
     pub intensity: AtomicF32,
     pub wind: AtomicF32,
     pub puddle: AtomicF32,
+    pub gust: AtomicF32,
     pub muted: AtomicBool,
     pub voices: AtomicU32,
+    /// 0 = residential street, 1 = neon city
+    pub scene: AtomicU32,
+    /// 0 = listening outside, 1 = inside the room
+    pub interior: AtomicF32,
+    /// how muffled the closed window is
+    pub muffle: AtomicF32,
+    /// how far the window is open, 0..1
+    pub open: AtomicF32,
+    pub city_life: AtomicF32,
+    /// scene transition dip, 0..1
+    pub fade: AtomicF32,
 }
 
 impl Default for AudioShared {
@@ -63,8 +88,15 @@ impl Default for AudioShared {
             intensity: AtomicF32::new(5.0),
             wind: AtomicF32::new(2.0),
             puddle: AtomicF32::new(0.5),
+            gust: AtomicF32::new(0.0),
             muted: AtomicBool::new(false),
             voices: AtomicU32::new(0),
+            scene: AtomicU32::new(0),
+            interior: AtomicF32::new(0.0),
+            muffle: AtomicF32::new(0.5),
+            open: AtomicF32::new(0.0),
+            city_life: AtomicF32::new(0.5),
+            fade: AtomicF32::new(0.0),
         }
     }
 }
@@ -82,8 +114,79 @@ pub struct Impact {
     pub size_mm: f32,
     pub speed: f32,
     pub surface: u8,
+    /// in the room with the listener (not heard through the glass)
+    pub inside: bool,
     /// start offset in samples (spreads a frame's impacts over the frame)
     pub delay: u32,
+}
+
+/// Messages from the simulation to the audio thread.
+#[derive(Clone, Copy, Debug)]
+pub enum AudioMsg {
+    Impact(Impact),
+    /// the lower sash starts sliding
+    Slide { opening: bool, seconds: f32 },
+}
+
+/// Stereo placement of a point source relative to the listener.
+pub struct Placement {
+    pub gain_l: f32,
+    pub gain_r: f32,
+    pub itd: i32,
+    pub shadow_l: f32,
+    pub shadow_r: f32,
+}
+
+pub fn place(p: glam::Vec3, cam: &CameraState, sr: f32) -> Placement {
+    let right = cam.right();
+    let fwd = glam::Vec3::new(cam.forward.x, 0.0, cam.forward.z).normalize_or(glam::Vec3::Z);
+    let rel = p - cam.pos;
+    let dist = rel.length().max(0.35);
+    let az = rel.dot(right).atan2(rel.dot(fwd));
+    let pan = az.sin().clamp(-1.0, 1.0);
+    let theta = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
+    let behind = if rel.dot(fwd) < 0.0 { 0.85 } else { 1.0 };
+    let g = (0.8 / dist).min(1.15) * behind;
+    let itd = (-pan * 0.00066 * sr).round() as i32;
+    let far = 1.0 - 0.8 * pan.abs();
+    let (shadow_l, shadow_r) = if pan > 0.0 { (far, 1.0) } else { (1.0, far) };
+    Placement { gain_l: theta.cos() * g, gain_r: theta.sin() * g, itd, shadow_l, shadow_r }
+}
+
+/// A single positioned impact (drips, glass taps, spatter).
+pub fn hit(p: glam::Vec3, cam: &CameraState, sr: f32, size_mm: f32, speed: f32, surface: u8, inside: bool, delay: u32) -> Impact {
+    let pl = place(p, cam, sr);
+    Impact {
+        gain_l: pl.gain_l,
+        gain_r: pl.gain_r,
+        itd: pl.itd,
+        shadow_l: pl.shadow_l,
+        shadow_r: pl.shadow_r,
+        size_mm,
+        speed,
+        surface,
+        inside,
+        delay,
+    }
+}
+
+/// Pushes the current settings and weather to the audio thread.
+pub fn update_shared(sh: &AudioShared, s: &crate::settings::Settings, w: &crate::weather::WeatherState, scene: crate::scene::SceneKind, interior: bool, open: f32, fade: f32) {
+    sh.master.set(s.master_volume);
+    sh.near.set(s.near_volume);
+    sh.far.set(s.far_volume);
+    sh.reverb.set(s.reverb);
+    sh.intensity.set(w.intensity);
+    sh.wind.set(w.wind.length());
+    sh.puddle.set(w.puddle_level);
+    sh.gust.set(w.gust);
+    sh.muted.store(s.muted, Ordering::Relaxed);
+    sh.scene.store(if scene == crate::scene::SceneKind::City { 1 } else { 0 }, Ordering::Relaxed);
+    sh.interior.set(if interior { 1.0 } else { 0.0 });
+    sh.muffle.set(s.muffle);
+    sh.open.set(open);
+    sh.city_life.set(s.city_life);
+    sh.fade.set(fade);
 }
 
 /// Individually voiced impacts per second (the loudest ones); the rest are
@@ -93,35 +196,12 @@ pub const VOICES_PER_SECOND: f32 = 2400.0;
 /// Turns GPU impacts into listener-relative voices. Keeps the loudest few.
 pub fn spatialise(events: &[GpuImpact], cam: &CameraState, sr: f32, frame_dt: f32, rng: &mut fastrand::Rng) -> Vec<Impact> {
     let max = (VOICES_PER_SECOND * frame_dt).ceil().max(1.0) as usize;
-    let right = cam.right();
-    let fwd = glam::Vec3::new(cam.forward.x, 0.0, cam.forward.z).normalize_or(glam::Vec3::Z);
     let mut out: Vec<(f32, Impact)> = events
         .iter()
         .map(|e| {
-            let p = glam::Vec3::from(e.pos);
-            let rel = p - cam.pos;
-            let dist = rel.length().max(0.35);
-            let az = rel.dot(right).atan2(rel.dot(fwd));
-            let pan = az.sin().clamp(-1.0, 1.0);
-            let theta = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
-            let behind = if rel.dot(fwd) < 0.0 { 0.85 } else { 1.0 };
-            let g = (0.8 / dist).min(1.15) * behind;
-            let itd = (-pan * 0.00066 * sr).round() as i32;
-            let far = 1.0 - 0.8 * pan.abs();
-            let (shadow_l, shadow_r) = if pan > 0.0 { (far, 1.0) } else { (1.0, far) };
             let delay = (rng.f32() * frame_dt.min(0.05) * sr) as u32;
-            let imp = Impact {
-                gain_l: theta.cos() * g,
-                gain_r: theta.sin() * g,
-                itd,
-                shadow_l,
-                shadow_r,
-                size_mm: e.size,
-                speed: e.speed,
-                surface: e.kind.min(255) as u8,
-                delay,
-            };
-            let loud = e.size.powf(1.6) * g;
+            let imp = hit(glam::Vec3::from(e.pos), cam, sr, e.size, e.speed, e.kind.min(255) as u8, false, delay);
+            let loud = e.size.powf(1.6) * (imp.gain_l + imp.gain_r);
             (loud, imp)
         })
         .collect();
@@ -135,7 +215,7 @@ pub fn spatialise(events: &[GpuImpact], cam: &CameraState, sr: f32, frame_dt: f3
 /// A running output stream.
 pub struct AudioOutput {
     _stream: cpal::Stream,
-    pub producer: rtrb::Producer<Impact>,
+    pub producer: rtrb::Producer<AudioMsg>,
     pub sample_rate: f32,
 }
 
@@ -148,7 +228,7 @@ pub fn start_output(shared: Arc<AudioShared>) -> Result<AudioOutput> {
     let channels = supported.channels() as usize;
     let format = supported.sample_format();
     let config = supported.config();
-    let (producer, consumer) = rtrb::RingBuffer::new(8192);
+    let (producer, consumer) = rtrb::RingBuffer::new(16384);
     let engine = AudioEngine::new(sr as f32, consumer, shared.clone());
     log::info!("audio: {device_name} @ {sr} Hz, {channels} ch, {format:?}");
 

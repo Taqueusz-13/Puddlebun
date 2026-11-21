@@ -100,7 +100,7 @@ Decisions:
 ## Stages
 
 1. ✅ **Engine core + residential street + rain physics + procedural audio + basic panel**
-2. **2a:** mid-height neon street window, glass drop/streak sim, open-a-crack, indoor muffled audio, the audio body/variety fixes, stylise slider, faster drift
+2. ✅ **2a:** mid-height neon street window, glass drop/streak sim, open-a-crack, indoor muffled audio, the audio body/variety fixes, stylise slider, faster drift
    **2b:** high-rise window view, puddle placement/shape fixes, rain variety (gust sheets, drips, slant)
 3. Glass synth panel with modulation and presets + node view + stats + wallpaper mode + fullscreen pause + install script
 4. Alley, residential house window, camera glides between spots, traffic, lightning and thunder, more room details
@@ -109,8 +109,17 @@ Decisions:
 ### Stage 1 notes for later stages
 
 - The rain particle count is scaled to the budget (k ≈ 0.045 of real density). Per-drop brightness is boosted ×4 to compensate, so relative densities stay physical.
-- The temporary egui panel (`src/ui.rs`) is replaced in stage 2.
+- The temporary egui panel (`src/ui.rs`) is replaced in stage 3.
 - Hooks already in place:
   - `misc.w` = lightning flash (sky, fog)
   - `SURF_*` kinds shared by shaders and audio
   - `--cam` / `--shot` for headless renders
+
+### Stage 2a notes for later stages
+
+- Places are numbered "spots": 0 = neon window, 1 = high-rise window (2b, key 2 shows a "coming in 2b" note for now), 2–7 = the six street viewpoints. `camera::spot_scene`, `next_spot` and `spot_names` are the single source of truth.
+- The neon window is on the third floor (sill at 8.07 m) so leaning in shows the street. Room and window geometry live in `city.rs` (`WindowGeom`, `build_room`), and the GPU collision heights for the outer sill and fire escape are `W_SILL_TOP` / `FE_TOP` in `world.wgsl`. Moving the window means moving all of those together.
+- From the window the rain box is 20 m wide, between our facade and the one opposite, at 2.2× the street density (nothing further away is visible).
+- Glass drops are drawn 1.35× their simulated size (`glass::VIS_SCALE`) so they read on screen. The simulation itself uses real sizes.
+- Audio messages are `AudioMsg::Impact` (with `inside` = in the room, not heard through the glass) and `AudioMsg::Slide`. Audio-only surfaces: `SURF_WOOD` (inner sill), `SURF_STONE` (outer sill).
+- Known for 2b: the city road seen from above looks grey and flat; it needs the puddle work and stronger wet reflections. Street drips from gutters and edges belong with "rain variety".

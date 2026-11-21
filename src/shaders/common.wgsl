@@ -25,6 +25,10 @@ struct Frame {
     ripple: vec4f,      // x texel size (m), y resolution, z tile size (m), w strength
     counts: vec4u,      // x lights, y street lamps (first in list), z active drops, w max drops
     misc: vec4f,        // x exposure, y window-light fraction, z bloom, w lightning flash
+    scene: vec4u,       // x scene (0 street, 1 city), y 1 = viewed from inside the room
+    room: vec4f,        // x lower-sash raise (m), y condensation, z stylise, w inner sill wetness
+    win_a: vec4f,       // window opening: x interior wall plane, y z_min, z z_max, w y_min
+    win_b: vec4f,       // x y_max, y outer glass plane x, z inner sill top y, w room lamp count
 }
 
 // A light. Street lamps come first in the array (counts.y of them).

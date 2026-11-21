@@ -47,8 +47,12 @@ struct VOut {
 @vertex
 fn vs_main(v: VIn) -> VOut {
     var o: VOut;
-    o.clip = frame.view_proj * vec4f(v.pos, 1.0);
-    o.wpos = v.pos;
+    var pos = v.pos;
+    if (v.mat >= 40u && v.extra.x > 0.5) {
+        pos.y += frame.room.x;   // the lower sash slides up when the window opens
+    }
+    o.clip = frame.view_proj * vec4f(pos, 1.0);
+    o.wpos = pos;
     o.nrm = v.nrm;
     o.uv = v.uv;
     o.mat = v.mat;
@@ -69,6 +73,7 @@ struct Surf {
     f0: f32,
     ground: f32,       // 1 = flat ground that receives planar reflections
     wet_scale: f32,    // how exposed the surface is to rain
+    cutout: f32,       // 1 = see-through (grates, railings)
 }
 
 fn surf_default() -> Surf {
@@ -84,11 +89,12 @@ fn surf_default() -> Surf {
     s.f0 = 0.04;
     s.ground = 0.0;
     s.wet_scale = 1.0;
+    s.cutout = 0.0;
     return s;
 }
 
 // ---------------------------------------------------------------- ground ----
-fn mat_road(p: vec3f) -> Surf {
+fn asphalt(p: vec3f) -> Surf {
     var s = surf_default();
     let xz = p.xz;
     let patchy = fbm(xz * 0.07);
@@ -106,7 +112,12 @@ fn mat_road(p: vec3f) -> Surf {
     s.porosity = 0.8;
     s.height = (fine - 0.5) * 0.0011 + (grit - 0.5) * 0.0005 + mid * 0.0006 - crack * 0.0015;
     s.ground = 1.0;
+    return s;
+}
 
+fn mat_road(p: vec3f) -> Surf {
+    var s = asphalt(p);
+    let xz = p.xz;
     let ax = abs(p.x);
     // double yellow lines along the kerb on some stretches
     let seg = fract(p.z / 95.0 + 0.3);
@@ -245,8 +256,9 @@ fn interior_radiance(lp: vec2f, wsize: vec2f, n: vec3f, tan_u: vec3f, v: vec3f, 
     if (dl.z <= 0.002) {
         return vec3f(0.0);
     }
+    let shop = (rs & 0x80000000u) != 0u;
     let rw = wsize.x + 1.9;
-    let depth = 3.0 + 1.5 * u01(hash_u(rs + 11u));
+    let depth = select(3.0 + 1.5 * u01(hash_u(rs + 11u)), 5.5, shop);
     let floor_y = -0.9;
     let ceil_y = floor_y + 2.65;
     let o = vec3f(lp.x - wsize.x * 0.5, lp.y, 0.0);
@@ -294,8 +306,23 @@ fn interior_radiance(lp: vec2f, wsize: vec2f, n: vec3f, tan_u: vec3f, v: vec3f, 
     if (lit) {
         let lamp_pos = vec3f(0.0, ceil_y - 0.45, depth * 0.55);
         let dd = distance(h, lamp_pos);
-        let warm = vec3f(1.0, 0.62, 0.32);
-        let bright = 0.25 + 0.75 * u01(hash_u(rs + 7u));
+        var warm = vec3f(1.0, 0.62, 0.32);
+        var bright = 0.25 + 0.75 * u01(hash_u(rs + 7u));
+        if (in_city()) {
+            let tp = u01(hash_u(rs + 23u));
+            if (tp > 0.85) {
+                warm = vec3f(0.75, 0.3, 1.0);
+            } else if (tp > 0.72) {
+                warm = vec3f(0.3, 0.85, 1.0);
+            } else if (tp > 0.55) {
+                warm = vec3f(0.85, 0.9, 1.0);
+            }
+        }
+        if (shop) {
+            bright = 2.2;
+            // shelves of stock
+            albedo *= 0.7 + 0.5 * step(0.5, fract(h.y * 3.0)) * step(0.3, fract(h.x * 1.7));
+        }
         rad = albedo * warm * bright / (0.5 + dd * dd * 0.3);
         // the lampshade itself
         let to_lamp = lamp_pos - o;
@@ -309,6 +336,9 @@ fn interior_radiance(lp: vec2f, wsize: vec2f, n: vec3f, tan_u: vec3f, v: vec3f, 
         }
     } else {
         rad = albedo * (frame.sky.rgb * frame.sky.w * 0.25 + frame.lamp.rgb * 0.004);
+    }
+    if (shop) {
+        return rad;
     }
 
     // curtains, partly drawn
@@ -572,13 +602,7 @@ fn eval_material(mat: u32, p: vec3f, n: vec3f, uv: vec2f, seed: f32, extra: vec2
             s.porosity = 0.0;
             return s;
         }
-        default: {
-            var s = surf_default();
-            s.albedo = vec3f(0.55, 0.55, 0.52);
-            s.rough = 0.5;
-            s.porosity = 0.1;
-            return s;
-        }
+        default: { return eval_city_material(mat, p, n, uv, seed, extra, v); }
     }
     return surf_default();
 }
@@ -721,11 +745,16 @@ fn fs_main(in: VOut) -> @location(0) vec4f {
     let diff = s.albedo * (1.0 - s.metal) * (1.0 - s.glass);
 
     var col = s.emit;
+    let interior = in.mat >= 40u;
 
     // direct light
     let nl_count = frame.counts.x;
     for (var i = 0u; i < nl_count; i++) {
         let l = lights[i];
+        let room_lamp = l.color.w > 2.5;
+        if (room_lamp && !interior) {
+            continue;   // room lamps don't light the street
+        }
         let lv = l.pos.xyz - p;
         let d2 = dot(lv, lv);
         if (d2 > l.pos.w * l.pos.w) {
@@ -736,7 +765,14 @@ fn fs_main(in: VOut) -> @location(0) vec4f {
         if (nl <= 0.0) {
             continue;
         }
-        let e = l.color.rgb * lamp_profile(l, -ldir) * light_atten(d2, l.pos.w) * nl;
+        var vis = 1.0;
+        if (interior && !room_lamp) {
+            vis = window_visibility(p, l.pos.xyz);
+            if (vis <= 0.0) {
+                continue;
+            }
+        }
+        let e = l.color.rgb * lamp_profile(l, -ldir) * light_atten(d2, l.pos.w) * nl * vis;
         let h = normalize(ldir + v);
         let nh = max(dot(n, h), 0.0);
         let vh = max(dot(v, h), 0.0);
@@ -749,6 +785,28 @@ fn fs_main(in: VOut) -> @location(0) vec4f {
         // the ground already sees lamp heads in the planar reflection
         let spec_w = select(1.0, 0.45, s.ground > 0.5 && !refl_pass);
         col += e * (diff * INV_PI * (vec3f(1.0) - f) + spec * spec_w);
+        // soft fabric sheen on the plush
+        if (in.mat == 44u || in.mat == 45u) {
+            col += e * s.albedo * pow(1.0 - nv, 3.0) * 0.6;
+        }
+    }
+
+    if (interior) {
+        // warm room bounce plus the glow of the city coming in through the window
+        let wc = vec3f(frame.win_b.y, (frame.win_a.w + frame.win_b.x) * 0.5, (frame.win_a.y + frame.win_a.z) * 0.5);
+        let tw = wc - p;
+        let fw = max(dot(n, normalize(tw)), 0.0) / (1.0 + dot(tw, tw) * 1.5);
+        let amb_in = vec3f(1.0, 0.72, 0.48) * 0.012 * (0.6 + 0.4 * n.y) + frame.sky.rgb * frame.sky.w * fw * 2.5;
+        col += diff * amb_in;
+        let r = reflect(-v, n);
+        let toward_window = smoothstep(0.2, 0.9, dot(r, normalize(tw)));
+        let env_in = vec3f(1.0, 0.75, 0.5) * 0.02 + frame.sky.rgb * frame.sky.w * toward_window * 2.0;
+        let fenv_in = f0 + (max(vec3f(1.0 - s.rough), f0) - f0) * pow(1.0 - nv, 5.0);
+        col += env_in * fenv_in * (1.0 - s.rough * 0.7);
+        if (s.cutout > 0.5) {
+            discard;
+        }
+        return vec4f(col, 1.0);
     }
 
     // ambient from the glowing sky
@@ -776,10 +834,31 @@ fn fs_main(in: VOut) -> @location(0) vec4f {
     col = apply_fog(col, cam, -v, dist);
 
     // the reflection pass must not draw the ground itself
-    if (refl_pass && ((p.y < 0.14 && n0.y > 0.5) || p.y < -0.02)) {
+    if (refl_pass && ((p.y < 0.2 && n0.y > 0.5) || p.y < -0.02)) {
+        discard;
+    }
+    if (s.cutout > 0.5) {
         discard;
     }
     return vec4f(col, 1.0);
+}
+
+// How much of a light outside reaches a point inside the room: the ray must
+// pass through the window opening.
+fn window_visibility(p: vec3f, lp: vec3f) -> f32 {
+    let xg = frame.win_b.y;
+    if (p.x <= xg + 0.001) {
+        return 1.0;
+    }
+    let d = lp - p;
+    if (d.x >= -1e-4) {
+        return 0.0;
+    }
+    let t = (xg - p.x) / d.x;
+    let q = p + d * t;
+    let mz = smoothstep(frame.win_a.y - 0.02, frame.win_a.y + 0.03, q.z) * smoothstep(frame.win_a.z + 0.02, frame.win_a.z - 0.03, q.z);
+    let my = smoothstep(frame.win_a.w - 0.02, frame.win_a.w + 0.03, q.y) * smoothstep(frame.win_b.x + 0.02, frame.win_b.x - 0.03, q.y);
+    return mz * my;
 }
 
 // ------------------------------------------------------------------ sky ----

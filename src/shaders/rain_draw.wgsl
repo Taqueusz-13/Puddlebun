@@ -49,7 +49,12 @@ fn vs_rain(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     o.uv = st.uv;
     let near_fade = smoothstep(0.25, 1.2, st.depth);
     let tr = exp(-fog_sigma() * st.depth);
-    o.col = d.light.rgb * st.energy * near_fade * tr;
+    // CPU drips (w = 1) have no precomputed light
+    var light = d.light.rgb;
+    if (d.light.w > 0.5) {
+        light = drop_light(d.pos);
+    }
+    o.col = light * st.energy * near_fade * tr;
     o.alpha = clamp(st.energy * 0.6, 0.0, 0.35) * near_fade;
     return o;
 }

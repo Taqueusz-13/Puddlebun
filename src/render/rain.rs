@@ -11,6 +11,34 @@ pub const SPLASH_DROPLETS: u32 = 8;
 pub const AUDIO_CAPACITY: u32 = 2048;
 pub const AUDIO_EVENT_SIZE: u64 = 32;
 pub const COUNTERS_SIZE: u64 = 16;
+/// extra drop slots after the simulated ones, written by the CPU (falling drips)
+pub const CPU_DROPS: u32 = 64;
+/// splashes written by the CPU: first half drawn outside, second half in the room
+pub const CPU_SPLASHES: u32 = 256;
+pub const CPU_SPLASHES_OUTSIDE: u32 = 128;
+
+/// Matches `Drop` in rain_sim.wgsl.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Default, Debug)]
+pub struct GpuDrop {
+    pub pos: [f32; 3],
+    pub size: f32,
+    pub vel: [f32; 3],
+    pub seed: u32,
+    pub light: [f32; 4],
+}
+
+/// Matches `Splash` in rain_sim.wgsl.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Default, Debug)]
+pub struct GpuSplash {
+    pub pos: [f32; 3],
+    pub t0: f32,
+    pub size: f32,
+    pub kind: u32,
+    pub seed: u32,
+    pub speed: f32,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
@@ -43,7 +71,9 @@ pub struct Rain {
     rain_pipeline: wgpu::RenderPipeline,
     splash_pipeline: wgpu::RenderPipeline,
     draw_bg: wgpu::BindGroup,
-    _drops: wgpu::Buffer,
+    cpu_draw_bg: wgpu::BindGroup,
+    pub cpu_splashes: wgpu::Buffer,
+    pub drops: wgpu::Buffer,
     _splashes: wgpu::Buffer,
 }
 
@@ -57,7 +87,7 @@ impl Rain {
         let storage_rw = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC;
         let drops = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("drops"),
-            size: max_particles as u64 * DROP_STRIDE,
+            size: (max_particles + CPU_DROPS) as u64 * DROP_STRIDE,
             usage: storage_rw,
             mapped_at_creation: false,
         });
@@ -128,6 +158,21 @@ impl Rain {
                 wgpu::BindGroupEntry { binding: 2, resource: splashes.as_entire_binding() },
             ],
         });
+        let cpu_splashes = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cpu splashes"),
+            size: CPU_SPLASHES as u64 * 32,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let cpu_draw_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cpu splash bg"),
+            layout: &draw_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: sim_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: drops.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: cpu_splashes.as_entire_binding() },
+            ],
+        });
         let draw_module = shader(device, "rain_draw", &[COMMON_WGSL, WORLD_WGSL, include_str!("../shaders/rain_draw.wgsl")]);
         let draw_layout = layout(device, "rain draw layout", &[frame_bgl, &draw_bgl]);
         let depth = depth_state(false, wgpu::CompareFunction::Greater);
@@ -166,7 +211,9 @@ impl Rain {
             rain_pipeline,
             splash_pipeline,
             draw_bg,
-            _drops: drops,
+            cpu_draw_bg,
+            cpu_splashes,
+            drops,
             _splashes: splashes,
         }
     }
@@ -181,14 +228,29 @@ impl Rain {
         pass.dispatch_workgroups(active.div_ceil(256), 1, 1);
     }
 
-    pub fn draw(&self, pass: &mut wgpu::RenderPass, frame_bg: &wgpu::BindGroup, active: u32) {
+    pub fn draw(&self, pass: &mut wgpu::RenderPass, frame_bg: &wgpu::BindGroup, active: u32, cpu_drops: u32) {
         pass.set_bind_group(0, frame_bg, &[]);
         pass.set_bind_group(1, &self.draw_bg, &[]);
         pass.set_pipeline(&self.splash_pipeline);
         pass.draw(0..6, 0..SPLASH_CAPACITY * SPLASH_DROPLETS);
+        pass.set_pipeline(&self.rain_pipeline);
         if active > 0 {
-            pass.set_pipeline(&self.rain_pipeline);
             pass.draw(0..6, 0..active);
         }
+        if cpu_drops > 0 {
+            let first = self.max_particles;
+            pass.draw(0..6, first..first + cpu_drops.min(CPU_DROPS));
+        }
+    }
+
+    /// Draws a range of the CPU-written splashes.
+    pub fn draw_cpu_splashes(&self, pass: &mut wgpu::RenderPass, frame_bg: &wgpu::BindGroup, range: std::ops::Range<u32>) {
+        if range.is_empty() {
+            return;
+        }
+        pass.set_bind_group(0, frame_bg, &[]);
+        pass.set_bind_group(1, &self.cpu_draw_bg, &[]);
+        pass.set_pipeline(&self.splash_pipeline);
+        pass.draw(0..6, range.start * SPLASH_DROPLETS..range.end * SPLASH_DROPLETS);
     }
 }

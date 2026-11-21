@@ -1,4 +1,5 @@
-//! Bloom chain and the final tonemap.
+//! Bloom chain, tonemap, the stylise pass, and a small blur chain the glass
+//! uses for condensation.
 
 use super::util::*;
 use super::HDR_FORMAT;
@@ -8,7 +9,9 @@ use bytemuck::{Pod, Zeroable};
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
 pub struct PostParams {
+    /// xy = 1/size of the source, z = karis (down) / stylise amount, w = radius / resolution scale
     pub texel: [f32; 4],
+    /// tonemap: exposure · stylise pass: fade
     pub exposure: f32,
     pub bloom: f32,
     pub time: f32,
@@ -30,12 +33,37 @@ pub struct Post {
     down: wgpu::RenderPipeline,
     up: wgpu::RenderPipeline,
     tonemap: wgpu::RenderPipeline,
+    stylise: wgpu::RenderPipeline,
     levels: Vec<(wgpu::Texture, wgpu::TextureView)>,
     down_passes: Vec<PassRes>,
     up_passes: Vec<PassRes>,
     tone: Option<PassRes>,
+    sty: Option<PassRes>,
+    ldr: Option<wgpu::TextureView>,
     dummy: wgpu::TextureView,
     encode_srgb: bool,
+    // blur of the outside view for the glass
+    blur_levels: Vec<(wgpu::Texture, wgpu::TextureView)>,
+    blur_passes: Vec<PassRes>,
+}
+
+fn run_pass(encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, pipe: &wgpu::RenderPipeline, bg: &wgpu::BindGroup, load: wgpu::LoadOp<wgpu::Color>) {
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("post pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_pipeline(pipe);
+    pass.set_bind_group(0, bg, &[]);
+    pass.draw(0..3, 0..1);
 }
 
 impl Post {
@@ -49,7 +77,8 @@ impl Post {
         let pl = layout(device, "post layout", &[&bgl]);
         let down = render_pipeline(device, "bloom down", &pl, &module, "vs_full", "fs_down", &[], HDR_FORMAT, None, None);
         let up = render_pipeline(device, "bloom up", &pl, &module, "vs_full", "fs_up", &[], HDR_FORMAT, Some(ADDITIVE), None);
-        let tonemap = render_pipeline(device, "tonemap", &pl, &module, "vs_full", "fs_tonemap", &[], output, None, None);
+        let tonemap = render_pipeline(device, "tonemap", &pl, &module, "vs_full", "fs_tonemap", &[], HDR_FORMAT, None, None);
+        let stylise = render_pipeline(device, "stylise", &pl, &module, "vs_full", "fs_stylise", &[], output, None, None);
         let (_t, dummy) = texture(device, "post dummy", 1, 1, HDR_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING);
         Self {
             bgl,
@@ -57,12 +86,17 @@ impl Post {
             down,
             up,
             tonemap,
+            stylise,
             levels: Vec::new(),
             down_passes: Vec::new(),
             up_passes: Vec::new(),
             tone: None,
+            sty: None,
+            ldr: None,
             dummy,
             encode_srgb: !output.is_srgb(),
+            blur_levels: Vec::new(),
+            blur_passes: Vec::new(),
         }
     }
 
@@ -88,11 +122,12 @@ impl Post {
         PassRes { bg, buf, params }
     }
 
-    pub fn resize(&mut self, device: &wgpu::Device, hdr: &wgpu::TextureView, w: u32, h: u32) {
+    /// (Re)creates everything that depends on the frame size.
+    pub fn resize(&mut self, device: &wgpu::Device, hdr: &wgpu::TextureView, outside: &wgpu::TextureView, w: u32, h: u32) {
+        let usage = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
         self.levels.clear();
         let (mut lw, mut lh) = ((w / 2).max(1), (h / 2).max(1));
         for i in 0..6 {
-            let usage = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
             self.levels.push(texture(device, &format!("bloom {i}"), lw, lh, HDR_FORMAT, usage));
             if lw <= 8 || lh <= 8 {
                 break;
@@ -103,7 +138,9 @@ impl Post {
         let n = self.levels.len();
         let mut down = Vec::new();
         for i in 0..n {
-            let (src, sw, sh, karis) = if i == 0 { (hdr, w, h, 1.0) } else {
+            let (src, sw, sh, karis) = if i == 0 {
+                (hdr, w, h, 1.0)
+            } else {
                 let t = &self.levels[i - 1].0;
                 (&self.levels[i - 1].1, t.width(), t.height(), 0.0)
             };
@@ -116,52 +153,72 @@ impl Post {
             let p = PostParams { texel: [1.0 / t.width() as f32, 1.0 / t.height() as f32, 0.0, 1.0], ..Default::default() };
             up.push(self.pass(device, &self.levels[i].1, &self.dummy, p));
         }
-        let tone = self.pass(device, hdr, &self.levels[0].1, PostParams::default());
+        let (_lt, ldr) = texture(device, "ldr", w, h, HDR_FORMAT, usage);
+        let tone = self.pass(device, hdr, &self.levels[0].1, PostParams { texel: [1.0 / w as f32, 1.0 / h as f32, 0.0, 1.0], ..Default::default() });
+        let sty = self.pass(device, &ldr, &self.dummy, PostParams { texel: [1.0 / w as f32, 1.0 / h as f32, 0.0, h as f32 / 1080.0], ..Default::default() });
         self.down_passes = down;
         self.up_passes = up;
         self.tone = Some(tone);
+        self.sty = Some(sty);
+        self.ldr = Some(ldr);
+
+        // half, quarter and eighth resolution blur of the outside view
+        self.blur_levels.clear();
+        self.blur_passes.clear();
+        let (mut bw, mut bh) = (w, h);
+        for i in 0..3 {
+            let (src_w, src_h) = (bw, bh);
+            bw = (bw / 2).max(1);
+            bh = (bh / 2).max(1);
+            self.blur_levels.push(texture(device, &format!("glass blur {i}"), bw, bh, HDR_FORMAT, usage));
+            let src = if i == 0 { outside } else { &self.blur_levels[i - 1].1 };
+            let p = PostParams { texel: [1.0 / src_w as f32, 1.0 / src_h as f32, 0.0, 1.0], ..Default::default() };
+            let pr = self.pass(device, src, &self.dummy, p);
+            self.blur_passes.push(pr);
+        }
     }
 
-    pub fn update(&mut self, queue: &wgpu::Queue, exposure: f32, bloom: f32, time: f32) {
+    /// The most blurred copy of the outside view (for the glass).
+    pub fn blurred_outside(&self) -> &wgpu::TextureView {
+        &self.blur_levels.last().expect("resized").1
+    }
+
+    pub fn update(&mut self, queue: &wgpu::Queue, exposure: f32, bloom: f32, time: f32, stylise: f32, fade: f32) {
         if let Some(t) = &mut self.tone {
             t.params.exposure = exposure;
             t.params.bloom = bloom;
             t.params.time = time;
-            t.params.encode_srgb = if self.encode_srgb { 1.0 } else { 0.0 };
-            t.params.vignette = 0.28;
-            t.params.grain = 0.018;
+            t.params.texel[2] = stylise;
             queue.write_buffer(&t.buf, 0, bytemuck::bytes_of(&t.params));
+        }
+        if let Some(s) = &mut self.sty {
+            s.params.exposure = fade;
+            s.params.time = time;
+            s.params.texel[2] = stylise;
+            s.params.encode_srgb = if self.encode_srgb { 1.0 } else { 0.0 };
+            s.params.vignette = 0.28 + 0.12 * stylise;
+            s.params.grain = 0.018 + 0.012 * stylise;
+            queue.write_buffer(&s.buf, 0, bytemuck::bytes_of(&s.params));
+        }
+    }
+
+    pub fn encode_blur(&self, encoder: &mut wgpu::CommandEncoder) {
+        for (i, p) in self.blur_passes.iter().enumerate() {
+            run_pass(encoder, &self.blur_levels[i].1, &self.down, &p.bg, wgpu::LoadOp::Clear(wgpu::Color::BLACK));
         }
     }
 
     pub fn encode(&self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView) {
         let n = self.levels.len();
-        let run = |encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, pipe: &wgpu::RenderPipeline, bg: &wgpu::BindGroup, load: wgpu::LoadOp<wgpu::Color>| {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("post pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(pipe);
-            pass.set_bind_group(0, bg, &[]);
-            pass.draw(0..3, 0..1);
-        };
         for i in 0..n {
-            run(encoder, &self.levels[i].1, &self.down, &self.down_passes[i].bg, wgpu::LoadOp::Clear(wgpu::Color::BLACK));
+            run_pass(encoder, &self.levels[i].1, &self.down, &self.down_passes[i].bg, wgpu::LoadOp::Clear(wgpu::Color::BLACK));
         }
         for (k, i) in (1..n).rev().enumerate() {
-            run(encoder, &self.levels[i - 1].1, &self.up, &self.up_passes[k].bg, wgpu::LoadOp::Load);
+            run_pass(encoder, &self.levels[i - 1].1, &self.up, &self.up_passes[k].bg, wgpu::LoadOp::Load);
         }
-        if let Some(t) = &self.tone {
-            run(encoder, target, &self.tonemap, &t.bg, wgpu::LoadOp::Clear(wgpu::Color::BLACK));
+        if let (Some(t), Some(ldr), Some(s)) = (&self.tone, &self.ldr, &self.sty) {
+            run_pass(encoder, ldr, &self.tonemap, &t.bg, wgpu::LoadOp::Clear(wgpu::Color::BLACK));
+            run_pass(encoder, target, &self.stylise, &s.bg, wgpu::LoadOp::Clear(wgpu::Color::BLACK));
         }
     }
 }

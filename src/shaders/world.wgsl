@@ -1,12 +1,20 @@
 // ============================================================================
 // world.wgsl — frame/light bindings plus everything that describes the world:
-// street layout, puddles, wind, sky, fog and how lamps light rain.
+// layouts of both scenes, puddles, collision surfaces, wind, sky, fog and how
+// lamps light rain.
 // ============================================================================
 
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(0) @binding(1) var<storage, read> lights: array<Light>;
 
-// Street layout (metres). The street runs along +Z; X = 0 is the road centre.
+const SCENE_STREET: u32 = 0u;
+const SCENE_CITY: u32 = 1u;
+
+fn in_city() -> bool {
+    return frame.scene.x == SCENE_CITY;
+}
+
+// --- residential street (metres). The street runs along +Z; X = 0 is the road centre.
 const ROAD_HALF: f32 = 3.6;   // road edge / kerb face
 const KERB_OUT: f32 = 3.75;   // back of kerb stone
 const PAVE_OUT: f32 = 5.8;    // pavement meets front-garden wall
@@ -14,12 +22,48 @@ const FACADE_X: f32 = 8.0;    // house fronts
 const KERB_H: f32 = 0.12;
 const EAVE_H: f32 = 6.2;
 
+// --- neon city street (must match src/city.rs)
+const C_ROAD_HALF: f32 = 6.0;
+const C_CURB_OUT: f32 = 6.15;
+const C_CURB_H: f32 = 0.15;
+const C_FACADE: f32 = 10.0;
+const C_MODULE: f32 = 7.6;
+const C_Z0: f32 = -152.0;
+// our window's outside sill and the fire escape below it
+const W_SILL_X0: f32 = 9.8;
+const W_SILL_X1: f32 = 10.02;
+const W_SILL_Z: f32 = 0.66;
+const W_SILL_TOP: f32 = 7.98;
+const FE_X0: f32 = 8.85;
+const FE_X1: f32 = 10.0;
+const FE_Z0: f32 = -3.4;
+const FE_Z1: f32 = 0.75;
+const FE_TOP: f32 = 7.2;
+
 // Surface kinds (shared with audio — see src/audio/mod.rs).
 const SURF_ROAD: u32 = 0u;
 const SURF_PUDDLE: u32 = 1u;
 const SURF_PAVE: u32 = 2u;
 const SURF_ROOF: u32 = 3u;
 const SURF_GARDEN: u32 = 4u;
+const SURF_METAL: u32 = 5u;
+const SURF_GLASS: u32 = 6u;
+const SURF_AWNING: u32 = 7u;
+const SURF_NONE: u32 = 8u;
+
+// ---- city building modules (same rules as src/city.rs) ----
+fn city_module(z: f32) -> i32 {
+    return i32(floor((z - C_Z0) / C_MODULE));
+}
+fn city_floors(m: i32) -> u32 {
+    return 5u + hash_u((bitcast<u32>(m) * 2654435761u) ^ 0x5bd1e995u) % 4u;
+}
+fn city_height(m: i32) -> f32 {
+    return 4.5 + f32(city_floors(m)) * 3.2;
+}
+fn city_has_awning(m: i32) -> bool {
+    return u01(hash_uu(bitcast<u32>(m), 77u)) > 0.35;
+}
 
 fn ground_height(p: vec2f) -> f32 {
     let ax = abs(p.x);
@@ -39,21 +83,39 @@ fn ground_height(p: vec2f) -> f32 {
     return KERB_H;
 }
 
+fn city_ground(p: vec2f) -> f32 {
+    let ax = abs(p.x);
+    if (ax < C_ROAD_HALF) {
+        return 0.0;
+    }
+    if (ax < C_FACADE) {
+        return C_CURB_H;
+    }
+    if (p.x > 0.0) {
+        return 80.0;   // inside our own building: drops end here silently
+    }
+    return city_height(city_module(p.y)) + 0.6;
+}
+
 // How much standing water there is at a ground position (0 = none, 1 = deep).
 fn puddle_amount(p: vec2f) -> f32 {
+    let city = in_city();
+    let road_half = select(ROAD_HALF, C_ROAD_HALF, city);
+    let kerb_out = select(KERB_OUT, C_CURB_OUT, city);
+    let pave_out = select(PAVE_OUT, C_FACADE - 0.3, city);
     let level = frame.weather.z;
     let ax = abs(p.x);
     // threshold in "standard deviations" of the surface noise, so the
     // puddle slider maps smoothly onto coverage
     let t = (level - 0.55) * 4.5 - 0.75;
-    if (ax < ROAD_HALF) {
+    if (ax < road_half) {
         // the road is cambered: water collects in the gutters, plus dips
-        let gutter = smoothstep(2.5, 3.5, ax);
+        let gutter = smoothstep(road_half - 1.1, road_half - 0.1, ax);
         let comb = fbm(p * vec2f(0.16, 0.12)) * 0.7 + fbm(p * 0.8 + vec2f(17.0, 3.0)) * 0.3;
         let hn = (comb - 0.5) / 0.076 - gutter * 1.3;
         return clamp((t - hn) * 0.8, 0.0, 1.0);
     }
-    if (ax > KERB_OUT && ax < PAVE_OUT) {
+    if (ax > kerb_out && ax < pave_out) {
         // sunken paving slabs hold shallow puddles
         let hn = (fbm(p * 0.5 + vec2f(41.0, 9.0)) - 0.5) / 0.1;
         return clamp((t - 0.9 - hn) * 0.9, 0.0, 1.0);
@@ -63,6 +125,18 @@ fn puddle_amount(p: vec2f) -> f32 {
 
 fn surface_kind(p: vec3f) -> u32 {
     let ax = abs(p.x);
+    if (in_city()) {
+        if (ax < C_FACADE && puddle_amount(p.xz) > 0.35) {
+            return SURF_PUDDLE;
+        }
+        if (ax < C_ROAD_HALF) {
+            return SURF_ROAD;
+        }
+        if (ax < C_FACADE) {
+            return SURF_PAVE;
+        }
+        return SURF_NONE;
+    }
     if (ax < PAVE_OUT && puddle_amount(p.xz) > 0.35) {
         return SURF_PUDDLE;
     }
@@ -76,6 +150,43 @@ fn surface_kind(p: vec3f) -> u32 {
         return SURF_ROOF;
     }
     return SURF_GARDEN;
+}
+
+// First surface below height `y_from` at p.xz: (height, kind).
+fn surface_under(p: vec3f, y_from: f32) -> vec2f {
+    if (!in_city()) {
+        let h = ground_height(p.xz);
+        return vec2f(h, f32(surface_kind(vec3f(p.x, h, p.z))));
+    }
+    if (p.x > W_SILL_X0 && p.x < W_SILL_X1 && abs(p.z) < W_SILL_Z && y_from >= W_SILL_TOP) {
+        return vec2f(W_SILL_TOP, f32(SURF_METAL));
+    }
+    if (p.x > FE_X0 && p.x < FE_X1 && p.z > FE_Z0 && p.z < FE_Z1 && y_from >= FE_TOP) {
+        return vec2f(FE_TOP, f32(SURF_METAL));
+    }
+    if (p.x < -8.4 && p.x > -C_FACADE && y_from >= 3.7) {
+        let m = city_module(p.z);
+        let local = p.z - (C_Z0 + f32(m) * C_MODULE);
+        if (city_has_awning(m) && local > 0.4 && local < C_MODULE - 0.4) {
+            return vec2f(3.7, f32(SURF_AWNING));
+        }
+    }
+    let h = city_ground(p.xz);
+    return vec2f(h, f32(surface_kind(vec3f(p.x, h, p.z))));
+}
+
+// Where house fronts are, and how tall the building is there (rain stops at walls).
+fn wall_x() -> f32 {
+    return select(FACADE_X, C_FACADE, in_city());
+}
+fn building_top(p: vec3f) -> f32 {
+    if (!in_city()) {
+        return EAVE_H;
+    }
+    if (p.x > 0.0) {
+        return 80.0;
+    }
+    return city_height(city_module(p.z));
 }
 
 // Wind at a point: the global (gusting) wind plus gust fronts that travel downwind.
@@ -92,13 +203,17 @@ fn wind_at(p: vec3f) -> vec3f {
     return vec3f(h.x, w.y, h.y);
 }
 
-// Street lamps throw light downwards with a soft cut-off; windows emit outwards.
+// Light kinds: 0 street lamp (downwards, soft cut-off), 1 window/neon sign
+// (hemisphere around dir), 2 omni outdoors, 3 lamp inside the room (omni).
 fn lamp_profile(l: Light, to_point: vec3f) -> f32 {
     let c = dot(to_point, l.dir.xyz);
     if (l.color.w < 0.5) {
         return smoothstep(l.dir.w, l.dir.w + 0.3, c) * (0.55 + 0.45 * c) + 0.012;
     }
-    return max(c, 0.0) * 0.9 + 0.1;
+    if (l.color.w < 1.5) {
+        return max(c, 0.0) * 0.9 + 0.1;
+    }
+    return 1.0;
 }
 
 fn light_atten(d2: f32, radius: f32) -> f32 {
@@ -137,7 +252,10 @@ fn lamp_inscatter(ro: vec3f, rd: vec3f, tmax: f32, l: Light, sigma: f32) -> vec3
     let to_pt = normalize(xc - l.pos.xyz + vec3f(0.0, -0.001, 0.0));
     let prof = lamp_profile(l, to_pt);
     let phase = hg(dot(to_pt, -rd), 0.7) * 0.75 + 0.25 * 0.25 * INV_PI;
-    let shimmer = 0.8 + 0.4 * rain_streak_noise(xc);
+    var shimmer = 1.0;
+    if (l.color.w < 0.5) {
+        shimmer = 0.8 + 0.4 * rain_streak_noise(xc);
+    }
     let ext = exp(-sigma * (tc + sqrt(h2 + 0.0)));
     return l.color.rgb * (sigma * 0.5) * integ * phase * prof * ext * shimmer;
 }

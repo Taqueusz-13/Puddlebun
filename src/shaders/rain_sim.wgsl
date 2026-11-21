@@ -21,7 +21,7 @@ struct Drop {
 struct SimParams {
     box_center: vec4f,  // xyz centre of the rain volume, w = half extent (m)
     box_y: vec4f,       // x bottom, y top, z shutter time (s), w dt
-    dsd: vec4f,         // x Λ (1/mm), y Dmin, z Dmax, w unused
+    dsd: vec4f,         // x Λ (1/mm), y Dmin, z Dmax, w max x (rain never goes past this)
     counts: vec4u,      // x active drops, y frame seed, z splash capacity, w audio capacity
     audio: vec4f,       // x audible radius, y min audible size, z splash radius, w ripple impulse scale
 }
@@ -98,8 +98,10 @@ fn ripple_stamp(p: vec2f, amp_um: f32) {
     }
 }
 
-fn impact(hp: vec3f, d: Drop, speed: f32, rng: ptr<function, u32>) {
-    let kind = surface_kind(hp);
+fn impact(hp: vec3f, kind: u32, d: Drop, speed: f32, rng: ptr<function, u32>) {
+    if (kind == SURF_NONE) {
+        return;
+    }
     atomicAdd(&counters.impacts, 1u);
     let dist = distance(hp, frame.cam_pos.xyz);
 
@@ -155,25 +157,31 @@ fn cs_update(@builtin(global_invocation_id) gid: vec3u) {
     d.vel.y = -vt + w.y;
 
     let p1 = d.pos + d.vel * dt;
-    let gh = ground_height(p1.xz);
+    let su = surface_under(p1, d.pos.y);
+    let gh = su.x;
     var hit = p1.y <= gh;
 
-    // drops blown into a house front stop there (no splash)
+    // drops blown into a building front stop there (no splash)
     let ax0 = abs(d.pos.x);
     let ax1 = abs(p1.x);
+    let wx = wall_x();
     var wall_hit = false;
-    if (ax0 < FACADE_X && ax1 >= FACADE_X && p1.y < EAVE_H) {
+    if (ax0 < wx && ax1 >= wx && p1.y < building_top(p1)) {
+        wall_hit = true;
+    }
+    // never rain inside the room (box limit on +x)
+    if (p1.x > sim.dsd.w) {
         wall_hit = true;
     }
 
     if (hit || wall_hit) {
         if (hit) {
-            impact(vec3f(p1.x, gh, p1.z), d, length(d.vel), &rng);
+            impact(vec3f(p1.x, gh, p1.z), u32(su.y + 0.5), d, length(d.vel), &rng);
         }
         // respawn at the top of the volume
         d.size = sample_size_flux(&rng);
         d.pos = vec3f(
-            c.x + (rnd(&rng) * 2.0 - 1.0) * half,
+            min(c.x + (rnd(&rng) * 2.0 - 1.0) * half, sim.dsd.w - 0.01),
             sim.box_y.y - rnd(&rng) * 1.5,
             c.z + (rnd(&rng) * 2.0 - 1.0) * half
         );

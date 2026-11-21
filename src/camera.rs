@@ -88,10 +88,48 @@ pub fn residential_shots() -> Vec<Shot> {
     ]
 }
 
+/// Places you can be: 0 = the neon window, 1 = the high-rise window
+/// (stage 2b), 2-7 = the residential street viewpoints.
+pub const SPOT_NEON_WINDOW: u32 = 0;
+pub const SPOT_HIGH_RISE: u32 = 1;
+pub const SPOT_COUNT: u32 = 8;
+
+pub fn spot_scene(spot: u32) -> crate::scene::SceneKind {
+    if spot < 2 { crate::scene::SceneKind::City } else { crate::scene::SceneKind::Street }
+}
+
+/// The spot after this one (skips places that don't exist yet).
+pub fn next_spot(spot: u32) -> u32 {
+    match spot {
+        0 | 1 => 2,
+        s if s + 1 >= SPOT_COUNT => 0,
+        s => s + 1,
+    }
+}
+
+pub fn spot_names() -> Vec<String> {
+    let mut v = vec!["Neon window".to_string(), "High-rise window".to_string()];
+    v.extend(residential_shots().iter().map(|s| s.name.to_string()));
+    v
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CamMode {
     Drift,
     Free,
+    /// sitting at the window: your head moves a little, you can lean in
+    Window,
+}
+
+/// Input for the head-behind-the-glass view.
+#[derive(Default, Clone, Copy)]
+pub struct HeadInput {
+    /// cursor position in -1..1 (x right, y down); None when outside the window
+    pub cursor: Option<glam::Vec2>,
+    /// scroll wheel lean (positive = closer)
+    pub lean_scroll: f32,
+    /// W/S held: +1 lean in, -1 lean back
+    pub lean_keys: f32,
 }
 
 #[derive(Default)]
@@ -116,10 +154,21 @@ pub struct CameraRig {
     yaw: f32,
     pitch: f32,
     last: CameraState,
+    window: Option<crate::city::WindowGeom>,
+    head: glam::Vec2,
+    lean: f32,
+    lean_target: f32,
+    idle: f32,
+    last_cursor: Option<glam::Vec2>,
+    t: f32,
 }
 
 const GLIDE_SECONDS: f32 = 9.0;
-const DOLLY_PERIOD: f32 = 80.0;
+/// Vertical field of view at the window (degrees).
+const WINDOW_FOV: f32 = 62.0;
+
+/// One full back-and-forth drift (20 s each way).
+const DOLLY_PERIOD: f32 = 40.0;
 
 fn smootherstep(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
@@ -141,6 +190,13 @@ impl CameraRig {
             yaw: 0.0,
             pitch: 0.0,
             last: CameraState { pos: Vec3::new(0.0, 1.6, 0.0), forward: Vec3::Z, fov_y: 55f32.to_radians() },
+            window: None,
+            head: glam::Vec2::ZERO,
+            lean: 0.0,
+            lean_target: 0.0,
+            idle: 10.0,
+            last_cursor: None,
+            t: 0.0,
         };
         rig.last = rig.shot_pose(0, 0.0);
         rig
@@ -159,12 +215,53 @@ impl CameraRig {
 
     pub fn go_to(&mut self, i: usize) {
         let i = i % self.shots.len();
-        self.glide_from = Some(self.last);
+        self.glide_from = if self.mode == CamMode::Window { None } else { Some(self.last) };
         self.glide_t = 0.0;
         self.current = i;
         self.shot_time = 0.0;
         self.since_switch = 0.0;
         self.mode = CamMode::Drift;
+    }
+
+    /// Sits down at a window (cut, no glide).
+    pub fn sit_at_window(&mut self, g: crate::city::WindowGeom) {
+        self.window = Some(g);
+        self.mode = CamMode::Window;
+        self.head = glam::Vec2::ZERO;
+        self.lean = 0.0;
+        self.lean_target = 0.0;
+        self.glide_from = None;
+        self.last = CameraState { pos: g.eye, forward: (g.look - g.eye).normalize(), fov_y: WINDOW_FOV.to_radians() };
+    }
+
+    fn window_pose(&mut self, dt: f32, input: &HeadInput) -> CameraState {
+        let g = self.window.expect("window mode without a window");
+        self.t += dt;
+        let t = self.t;
+        let moved = match (input.cursor, self.last_cursor) {
+            (Some(a), Some(b)) => a.distance(b) > 0.002,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        self.last_cursor = input.cursor;
+        if moved || input.lean_scroll != 0.0 || input.lean_keys != 0.0 {
+            self.idle = 0.0;
+        } else {
+            self.idle += dt;
+        }
+        let mut target = input.cursor.map(|c| glam::Vec2::new(c.x, -c.y)).unwrap_or(glam::Vec2::ZERO);
+        // idle: drift gently as if breathing and shifting in the chair
+        let sway = glam::Vec2::new((t * 0.11).sin() * 0.3 + (t * 0.071).sin() * 0.2, (t * 0.17).sin() * 0.18 + (t * 0.05).sin() * 0.1);
+        let k_idle = ((self.idle - 2.5) / 2.5).clamp(0.0, 1.0);
+        target = target * (1.0 - k_idle * 0.6) + sway * k_idle;
+        self.head += (target - self.head) * (1.0 - (-dt * 3.5).exp());
+        self.lean_target = (self.lean_target + input.lean_scroll * 0.06 + input.lean_keys * dt * 0.45).clamp(0.0, 0.75);
+        self.lean += (self.lean_target - self.lean) * (1.0 - (-dt * 5.0).exp());
+        let breathe = (t * std::f32::consts::TAU * 0.22).sin() * 0.004;
+        // looking out along -x: right is -z
+        let eye = g.eye + Vec3::new(-self.lean, self.head.y * 0.26 + breathe, -self.head.x * 0.42);
+        let look = g.look + Vec3::new(0.0, self.head.y * 2.2 - self.lean * 11.0, -self.head.x * 2.6);
+        CameraState { pos: eye, forward: (look - eye).normalize(), fov_y: WINDOW_FOV.to_radians() }
     }
 
     /// Cuts straight to a viewpoint (no glide).
@@ -180,6 +277,7 @@ impl CameraRig {
 
     pub fn toggle_free(&mut self) {
         match self.mode {
+            CamMode::Window => {}
             CamMode::Drift => {
                 self.mode = CamMode::Free;
                 self.free_pos = self.last.pos;
@@ -195,8 +293,9 @@ impl CameraRig {
         }
     }
 
-    pub fn update(&mut self, dt: f32, input: &MoveInput, drift_interval: f32, auto_advance: bool, fov_override: Option<f32>) -> CameraState {
+    pub fn update(&mut self, dt: f32, input: &MoveInput, head: &HeadInput, drift_interval: f32, auto_advance: bool, fov_override: Option<f32>) -> CameraState {
         let state = match self.mode {
+            CamMode::Window => self.window_pose(dt, head),
             CamMode::Drift => {
                 self.shot_time += dt;
                 self.since_switch += dt;

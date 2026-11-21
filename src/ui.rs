@@ -1,6 +1,5 @@
-//! Stage-1 control panel (temporary — stage 2 replaces it with the glass synth panel).
+//! Temporary control panel (stage 3 replaces it with the glass synth panel).
 
-use crate::camera::{CamMode, CameraRig};
 use crate::settings::Settings;
 use egui::{Color32, RichText};
 
@@ -20,12 +19,21 @@ pub struct Stats {
     pub ripple_steps: u32,
     pub audio_device: String,
     pub gpu: String,
+    pub glass_drops: u32,
+    pub spot: u32,
+    pub spot_names: Vec<String>,
+    pub free: bool,
+    pub window_moving: bool,
+    /// a short message and its opacity
+    pub toast: Option<(String, f32)>,
 }
 
 #[derive(Default)]
 pub struct UiActions {
     pub screenshot: bool,
     pub reset: bool,
+    pub go_spot: Option<u32>,
+    pub toggle_free: bool,
 }
 
 pub fn style(ctx: &egui::Context) {
@@ -41,8 +49,25 @@ fn slider(ui: &mut egui::Ui, v: &mut f32, range: std::ops::RangeInclusive<f32>, 
     ui.add(egui::Slider::new(v, range).text(label)).changed()
 }
 
-pub fn draw(ctx: &egui::Context, s: &mut Settings, stats: &Stats, cam: &mut CameraRig, hint_alpha: f32) -> UiActions {
+pub fn draw(ctx: &egui::Context, s: &mut Settings, stats: &Stats, hint_alpha: f32) -> UiActions {
     let mut act = UiActions::default();
+    let at_window = stats.spot < 2;
+
+    if let Some((msg, a)) = &stats.toast {
+        egui::Area::new(egui::Id::unique("puddlebun-toast"))
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 40.0))
+            .interactable(false)
+            .show(ctx, |ui| {
+                let a = (a * 255.0) as u8;
+                egui::Frame::new()
+                    .fill(Color32::from_rgba_unmultiplied(14, 16, 22, (a as f32 * 0.8) as u8))
+                    .corner_radius(10)
+                    .inner_margin(egui::Margin::symmetric(14, 8))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(msg).color(Color32::from_rgba_unmultiplied(230, 236, 255, a)).size(15.0));
+                    });
+            });
+    }
 
     if hint_alpha > 0.0 {
         egui::Area::new(egui::Id::unique("puddlebun-hint"))
@@ -51,7 +76,11 @@ pub fn draw(ctx: &egui::Context, s: &mut Settings, stats: &Stats, cam: &mut Came
             .show(ctx, |ui| {
                 let a = (hint_alpha * 255.0) as u8;
                 ui.label(
-                    RichText::new("Tab  controls    F  free-fly    1–6  viewpoints    N  next    M  mute    F11  fullscreen    F12  screenshot")
+                    RichText::new(if at_window {
+                        "Tab  controls    mouse  look around    scroll / W S  lean in    O  open the window    N  next place    M  mute    F11  fullscreen"
+                    } else {
+                        "Tab  controls    F  free-fly    1  window    3–8  street views    N  next place    M  mute    F11  fullscreen    F12  screenshot"
+                    })
                         .color(Color32::from_rgba_unmultiplied(220, 228, 255, a))
                         .size(14.0),
                 );
@@ -84,8 +113,39 @@ pub fn draw(ctx: &egui::Context, s: &mut Settings, stats: &Stats, cam: &mut Came
         .resizable(false)
         .collapsible(true)
         .show(ctx, |ui| {
-            ui.label(RichText::new("Stage 1 controls — the glass synth panel arrives in stage 2").small().weak());
+            ui.label(RichText::new("Temporary controls — the glass synth panel arrives in stage 3").small().weak());
             ui.add_space(4.0);
+
+            egui::CollapsingHeader::new("Where").default_open(true).show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for (i, name) in stats.spot_names.iter().enumerate() {
+                        let i = i as u32;
+                        let key = match i {
+                            0 => "1".to_string(),
+                            1 => "2".to_string(),
+                            k => (k + 1).to_string(),
+                        };
+                        let label = format!("{key} {name}");
+                        let enabled = i != 1;
+                        let sel = stats.spot == i && !stats.free;
+                        if ui.add_enabled(enabled, egui::Button::selectable(sel, label)).on_disabled_hover_text("arrives in stage 2b").clicked() {
+                            act.go_spot = Some(i);
+                        }
+                    }
+                });
+                if at_window {
+                    let label = if s.window_open { "Close the window (O)" } else { "Open the window a crack (O)" };
+                    if ui.add_enabled(!stats.window_moving, egui::Button::new(label)).clicked() {
+                        s.window_open = !s.window_open;
+                    }
+                    slider(ui, &mut s.condensation, 0.0..=1.0, "condensation");
+                    ui.label(RichText::new("Move the mouse to shift your head · scroll or W/S to lean in").small().weak());
+                } else if ui.selectable_label(stats.free, "Free-fly (F): WASD, hold right mouse to look, Shift = fast, Space/C = up/down").clicked() {
+                    act.toggle_free = true;
+                }
+                ui.checkbox(&mut s.auto_switch, "Move to the next place by itself");
+                ui.add_enabled(s.auto_switch, egui::Slider::new(&mut s.drift_interval_s, 20.0..=1800.0).logarithmic(true).text("every (s)"));
+            });
 
             egui::CollapsingHeader::new("Rain & wind").default_open(true).show(ui, |ui| {
                 ui.add(egui::Slider::new(&mut s.intensity_mm_h, 0.1..=120.0).logarithmic(true).text("rain (mm/h)"));
@@ -101,7 +161,7 @@ pub fn draw(ctx: &egui::Context, s: &mut Settings, stats: &Stats, cam: &mut Came
                 )).small().weak());
             });
 
-            egui::CollapsingHeader::new("Street").default_open(true).show(ui, |ui| {
+            egui::CollapsingHeader::new("Streets").default_open(true).show(ui, |ui| {
                 slider(ui, &mut s.wetness, 0.0..=1.0, "wetness");
                 ui.add_enabled(!s.auto_puddles, egui::Slider::new(&mut s.puddle_level, 0.0..=1.0).text("puddles"));
                 ui.checkbox(&mut s.auto_puddles, "Puddles fill and dry by themselves");
@@ -118,23 +178,12 @@ pub fn draw(ctx: &egui::Context, s: &mut Settings, stats: &Stats, cam: &mut Came
                 slider(ui, &mut s.near_volume, 0.0..=2.0, "nearby drops");
                 slider(ui, &mut s.far_volume, 0.0..=2.0, "distant rain");
                 slider(ui, &mut s.reverb, 0.0..=1.0, "street echo");
+                slider(ui, &mut s.muffle, 0.0..=1.0, "window muffle");
+                slider(ui, &mut s.city_life, 0.0..=1.0, "city life");
             });
 
-            egui::CollapsingHeader::new("Camera & look").default_open(false).show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for i in 0..cam.shots.len() {
-                        let sel = cam.current == i && cam.mode == CamMode::Drift;
-                        if ui.selectable_label(sel, format!("{} {}", i + 1, cam.shots[i].name)).clicked() {
-                            cam.go_to(i);
-                        }
-                    }
-                });
-                let free = cam.mode == CamMode::Free;
-                if ui.selectable_label(free, "Free-fly (F): WASD, hold right mouse to look, Shift = fast, Space/C = up/down").clicked() {
-                    cam.toggle_free();
-                }
-                ui.checkbox(&mut s.drift, "Drift to the next viewpoint automatically");
-                ui.add_enabled(s.drift, egui::Slider::new(&mut s.drift_interval_s, 20.0..=1800.0).logarithmic(true).text("every (s)"));
+            egui::CollapsingHeader::new("Look").default_open(true).show(ui, |ui| {
+                slider(ui, &mut s.stylise, 0.0..=1.0, "stylise (real → lo-fi)");
                 slider(ui, &mut s.exposure_ev, -3.0..=3.0, "exposure (EV)");
                 slider(ui, &mut s.bloom, 0.0..=2.5, "bloom");
                 let mut shutter_ms = s.shutter * 1000.0;
@@ -155,8 +204,8 @@ pub fn draw(ctx: &egui::Context, s: &mut Settings, stats: &Stats, cam: &mut Came
 
             ui.separator();
             ui.label(RichText::new(format!(
-                "{:.0} fps · {:.2} ms · {} drops · {:.0} impacts/s · {:.0} voiced/s · {} voices · {} lights",
-                stats.fps, stats.frame_ms, stats.active_drops, stats.impacts_per_s, stats.audible_per_s, stats.voices, stats.lights
+                "{:.0} fps · {:.2} ms · {} drops · {} on glass · {:.0} impacts/s · {:.0} voiced/s · {} voices · {} lights",
+                stats.fps, stats.frame_ms, stats.active_drops, stats.glass_drops, stats.impacts_per_s, stats.audible_per_s, stats.voices, stats.lights
             )).small().monospace());
             ui.label(RichText::new(format!("{}  ·  {}", stats.gpu, stats.audio_device)).small().weak());
             ui.horizontal(|ui| {

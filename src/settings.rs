@@ -44,8 +44,23 @@ pub struct Settings {
     pub far_volume: f32,
     pub reverb: f32,
 
+    // --- look ---
+    /// 0 = realistic (stage 1), 1 = full lo-fi / neon
+    pub stylise: f32,
+
+    // --- window ---
+    pub window_open: bool,
+    pub condensation: f32,
+    /// how muffled the rain is with the window shut (0 = barely, 1 = very)
+    pub muffle: f32,
+    /// how much city life you hear (tyres, sirens, the train)
+    pub city_life: f32,
+
     // --- camera ---
-    pub drift: bool,
+    /// which spot you were at: 0 = neon window, 1 = high-rise (stage 2b), 2-7 = street viewpoints
+    pub spot: u32,
+    /// move to the next spot automatically
+    pub auto_switch: bool,
     /// Seconds between automatic moves to the next viewpoint.
     pub drift_interval_s: f32,
     pub fov_deg: f32,
@@ -84,8 +99,14 @@ impl Default for Settings {
             near_volume: 1.0,
             far_volume: 1.0,
             reverb: 0.5,
-            drift: true,
-            drift_interval_s: 600.0,
+            stylise: 0.7,
+            window_open: false,
+            condensation: 0.55,
+            muffle: 0.5,
+            city_life: 0.5,
+            spot: 0,
+            auto_switch: false,
+            drift_interval_s: 180.0,
             fov_deg: 55.0,
             max_particles: 1_000_000,
             reflection_scale: 0.5,
@@ -156,6 +177,11 @@ impl Settings {
         self.far_volume = self.far_volume.clamp(0.0, 2.0);
         self.reverb = self.reverb.clamp(0.0, 1.0);
         self.drift_interval_s = self.drift_interval_s.clamp(20.0, 3600.0);
+        self.stylise = self.stylise.clamp(0.0, 1.0);
+        self.condensation = self.condensation.clamp(0.0, 1.0);
+        self.muffle = self.muffle.clamp(0.0, 1.0);
+        self.city_life = self.city_life.clamp(0.0, 1.0);
+        self.spot = self.spot.min(7);
         self.fov_deg = self.fov_deg.clamp(25.0, 100.0);
         self.max_particles = self.max_particles.clamp(10_000, 4_000_000);
         self.reflection_scale = self.reflection_scale.clamp(0.25, 1.0);

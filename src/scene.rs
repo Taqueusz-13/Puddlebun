@@ -141,10 +141,127 @@ impl MeshBuilder {
     }
 }
 
+/// How a static light gets its colour each frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Tint {
+    /// fixed colour × intensity
+    Fixed,
+    /// street lamp: colour from the lamp-colour setting × lamp brightness
+    StreetLamp,
+    /// city LED street lamp: cool white × lamp brightness
+    CityLamp,
+}
+
+/// A light that's part of a scene (lamps, neon signs, shop windows, room lamps).
 #[derive(Clone, Copy, Debug)]
-pub struct LampDef {
-    /// Where the light is emitted (just under the lamp head).
+pub struct StaticLight {
     pub pos: Vec3,
+    pub radius: f32,
+    /// 0 street lamp (downwards), 1 hemisphere around `dir`, 2 omni outdoors, 3 room lamp
+    pub kind: u32,
+    pub dir: Vec3,
+    pub cos_cut: f32,
+    pub color: Vec3,
+    pub tint: Tint,
+    /// 0 = steady, otherwise the seed of a neon flicker pattern (see `neon_flicker`)
+    pub flicker: u32,
+}
+
+impl StaticLight {
+    pub fn lamp(pos: Vec3, tint: Tint) -> Self {
+        Self { pos, radius: 38.0, kind: 0, dir: -Vec3::Y, cos_cut: 0.2, color: Vec3::ONE, tint, flicker: 0 }
+    }
+}
+
+/// Same flicker rule as `neon_flicker` in city.wgsl.
+pub fn neon_flicker(seed: u32, t: f32) -> f32 {
+    match seed % 7 {
+        0 => {
+            let k = hash_uu(seed, (t * 14.0) as u32);
+            if u01(k) < 0.12 { 0.15 } else { 1.0 }
+        }
+        1 => {
+            if (t * 0.45 + u01(hash_u(seed))).fract() < 0.7 { 1.0 } else { 0.08 }
+        }
+        _ => 1.0,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SceneKind {
+    Street,
+    City,
+}
+
+/// A whole renderable place: outside geometry, its lights, optional room.
+pub struct World {
+    pub kind: SceneKind,
+    pub mesh: MeshBuilder,
+    /// lamps / neon first: these light the rain and glow in the mist
+    pub lights: Vec<StaticLight>,
+    /// lights that only light surfaces (shop windows)
+    pub fill_lights: Vec<StaticLight>,
+    pub windows: Vec<WindowDef>,
+    /// sky glow colour × brightness
+    pub sky: Vec3,
+    pub room: Option<crate::city::Room>,
+}
+
+impl MeshBuilder {
+    /// An ellipsoid (UV sphere) with radii `r`, rotated by `rot`, at `c`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ellipsoid(&mut self, c: Vec3, r: Vec3, rot: glam::Quat, segs: u32, rings: u32, mat: u32, seed: f32, extra: Vec2) {
+        let base = self.vertices.len() as u32;
+        for j in 0..=rings {
+            let th = j as f32 / rings as f32 * std::f32::consts::PI;
+            for i in 0..=segs {
+                let ph = i as f32 / segs as f32 * std::f32::consts::TAU;
+                let unit = Vec3::new(th.sin() * ph.cos(), th.cos(), th.sin() * ph.sin());
+                let p = c + rot * (unit * r);
+                let n = (rot * (unit / r)).normalize();
+                self.vertices.push(Vertex {
+                    pos: p.to_array(),
+                    mat,
+                    normal: n.to_array(),
+                    seed,
+                    uv: [i as f32 / segs as f32, j as f32 / rings as f32],
+                    extra: extra.to_array(),
+                });
+            }
+        }
+        let row = segs + 1;
+        for j in 0..rings {
+            for i in 0..segs {
+                let a = base + j * row + i;
+                let b = a + row;
+                self.indices.extend_from_slice(&[a, b, a + 1, a + 1, b, b + 1]);
+            }
+        }
+    }
+
+    /// A cone/frustum around +Y from `base` with radii r0 (bottom) → r1 (top).
+    #[allow(clippy::too_many_arguments)]
+    pub fn frustum(&mut self, base: Vec3, r0: f32, r1: f32, height: f32, segs: u32, mat: u32, seed: f32) {
+        for i in 0..segs {
+            let a0 = i as f32 / segs as f32 * std::f32::consts::TAU;
+            let a1 = (i + 1) as f32 / segs as f32 * std::f32::consts::TAU;
+            let d0 = Vec3::new(a0.cos(), 0.0, a0.sin());
+            let d1 = Vec3::new(a1.cos(), 0.0, a1.sin());
+            let slope = (r0 - r1) / height;
+            let n = ((d0 + d1).normalize() + Vec3::Y * slope).normalize();
+            let p = [base + d0 * r0, base + d1 * r0, base + d1 * r1 + Vec3::Y * height, base + d0 * r1 + Vec3::Y * height];
+            let uv = [Vec2::new(a0 * r0, 0.0), Vec2::new(a1 * r0, 0.0), Vec2::new(a1 * r1, height), Vec2::new(a0 * r1, height)];
+            self.quad(p, n, uv, mat, seed, Vec2::ZERO);
+        }
+    }
+
+    /// Appends another mesh.
+    #[allow(dead_code)]
+    pub fn append(&mut self, other: &MeshBuilder) {
+        let base = self.vertices.len() as u32;
+        self.vertices.extend_from_slice(&other.vertices);
+        self.indices.extend(other.indices.iter().map(|i| i + base));
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -155,17 +272,12 @@ pub struct WindowDef {
     pub window: u32,
 }
 
-pub struct Street {
-    pub mesh: MeshBuilder,
-    pub lamps: Vec<LampDef>,
-    pub windows: Vec<WindowDef>,
-}
 
 pub fn house_id(side: f32, i: u32) -> u32 {
     if side > 0.0 { 1000 + i } else { 2000 + i }
 }
 
-pub fn build_street() -> Street {
+pub fn build_street() -> World {
     let mut m = MeshBuilder::default();
     let z0 = Z_START;
     let z1 = Z_START + HOUSES_PER_SIDE as f32 * HOUSE_W;
@@ -305,7 +417,7 @@ pub fn build_street() -> Street {
         // lamp head (LED panel underneath)
         let hx = arm_end;
         m.cuboid(Vec3::new(hx - 0.32, 5.84, z - 0.14), Vec3::new(hx + 0.32, 5.96, z + 0.14), M_LAMP, 0.0, 63, Vec3::new(hx, 0.0, z), zero);
-        lamps.push(LampDef { pos: Vec3::new(hx, 5.78, z) });
+        lamps.push(StaticLight::lamp(Vec3::new(hx, 5.78, z), Tint::StreetLamp));
     }
 
     // windows that can spill light onto the street
@@ -321,7 +433,15 @@ pub fn build_street() -> Street {
         }
     }
 
-    Street { mesh: m, lamps, windows }
+    World {
+        kind: SceneKind::Street,
+        mesh: m,
+        lights: lamps,
+        fill_lights: Vec::new(),
+        windows,
+        sky: Vec3::new(1.0, 0.62, 0.4) * 0.034,
+        room: None,
+    }
 }
 
 /// Same rule as `is_lit` in scene.wgsl.
@@ -338,7 +458,7 @@ mod tests {
         let s = build_street();
         assert!(s.mesh.vertices.len() > 1000);
         assert_eq!(s.mesh.indices.len() % 3, 0);
-        assert!(s.lamps.len() >= 10);
+        assert!(s.lights.len() >= 10);
         assert!(s.mesh.indices.iter().all(|&i| (i as usize) < s.mesh.vertices.len()));
     }
 

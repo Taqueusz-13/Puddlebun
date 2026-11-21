@@ -1,8 +1,8 @@
-# 🐰🌧 Puddlebun
+# Puddlebun
 
-A high-quality rain simulator for CachyOS: a photoreal rainy British street at night, GPU raindrop physics, live puddle ripples, and fully procedural, positional rain audio driven by the simulation.
+A rain simulator for CachyOS. You sit at a window on the third floor over a wet neon street at night, with rain running down the glass and the city muffled behind it. There's also a rainy British residential street you can walk around in. Rain is simulated on the GPU, and every sound is synthesised from that simulation.
 
-**This is stage 1.** See [SPEC.md](SPEC.md) for the full plan and the review decisions.
+This is stage 2a. See [SPEC.md](SPEC.md) for the full plan and the review decisions.
 
 ## Build and run (CachyOS)
 
@@ -24,23 +24,31 @@ The first build takes a minute or two. After that, `cargo run --release` starts 
 
 ## Controls
 
+At the window:
+
 | Key | Action |
 |---|---|
-| **Tab** | Show or hide the control panel |
-| **F** | Free-fly camera on or off |
-| WASD | Move (in free-fly) |
-| Right mouse (hold) | Look around (in free-fly) |
-| Shift | Move faster |
-| Space / C | Up / down |
-| **1–6** | Jump to a viewpoint: down the street, gutter, under the lamp, up high, bay windows, puddle mirror |
-| **N** | Next viewpoint |
-| **M** | Mute |
-| **F11** | Fullscreen |
-| **F12** | Screenshot, saved to `~/Pictures/Puddlebun/` |
+| Mouse | Move your head a little (it drifts on its own when you stop) |
+| Scroll, W / S | Lean in towards the glass, or sit back. Lean in to look down at the street |
+| O | Open the window a crack, or close it |
+
+Everywhere:
+
+| Key | Action |
+|---|---|
+| Tab | Show or hide the control panel |
+| 1 | The neon window |
+| 2 | The high-rise window (stage 2b) |
+| 3–8 | Street viewpoints: down the street, gutter, under the lamp, up high, bay windows, puddle mirror |
+| N | Next place |
+| F | Free-fly on the street (WASD, hold right mouse to look, Shift faster, Space / C up and down) |
+| M | Mute |
+| F11 | Fullscreen |
+| F12 | Screenshot, saved to `~/Pictures/Puddlebun/` |
 | Esc | Leave free-fly or fullscreen |
 | Ctrl+Q | Quit |
 
-By default the camera drifts slowly around a viewpoint and glides to the next one every 10 minutes. You can change the interval under *Camera & look*.
+The camera stays where you put it. On the street it drifts slowly back and forth over 40 seconds. If you want it to move on by itself, tick "Move to the next place by itself" in the panel and set the interval.
 
 ## Settings
 
@@ -52,69 +60,42 @@ kate ~/.config/puddlebun/settings.toml
 
 If you break something, delete the file or start with `cargo run --release -- --reset-settings`.
 
-## What stage 1 does
+## What stage 2a adds
 
-**The street.** A procedurally built terraced street with:
+The window. A small room on the third floor: a sash window with a stone sill outside and a wooden one inside, the Puddlebun plush on the sill and an old radiator underneath. Across the road is a New York style street with fire escapes, awnings, shop fronts and neon signs (mostly English, a couple in Japanese). The room is lit by a low lamp behind you, and the neon spills in through the glass.
 
-- brick fronts and ground-floor bay windows
-- sash windows that open onto little rooms (interior mapping): some lit, some with curtains, a few with a TV flickering
-- slate roofs and chimney stacks with pots, garden walls with coping, and kerbs
-- double yellow lines, gully grates and manhole covers
-- sodium-style street lamps every 30 m
+The glass. Raindrops hit the panes where the wind drives them, sit, grow and merge. Once a drop is heavy enough it runs, wobbling, sticking on rough patches, following the wet trails of earlier runners and leaving beads behind. Each drop works as a tiny lens that glows with the lights behind it. A fine spray haze builds up and the runners wipe clear paths through it. Condensation creeps in from the edges of each pane (there's a slider for it).
 
-**Wet surfaces.**
+Opening the window. Press O and the lower sash sticks for a moment, then slides up about 10 cm. Rain spatters onto the inner sill, which darkens and dries again slowly, the condensation clears, and the city gets louder. Water also drips from the window head onto the stone sill and from the sill onto the fire escape below.
 
-- Porous materials darken when wet and everything gets glossier.
-- Puddles collect in the gutters and in dips in the road, and in sunken paving slabs.
-- Reflections come from a mirrored render of the street, stretched vertically by surface roughness, which gives the streaky lamp reflections of wet tarmac.
-- Lamp highlights have a physical size, so they show up in windows and on wet walls.
+Sound. The audio was rebuilt from the ground up after the stage 1 review, when it was too thin.
 
-**Rain physics, on the GPU, up to 1M drops.**
+- The distant rain is several layers: a pink-noise wash, a low roar for body, thousands of small taps on different materials arriving in clumps, awnings drumming, far-off metal pings, puddle plinks, and a drainpipe gurgling as it fills. Slow random drift and gust swells keep it changing.
+- Nearby drops ring with the thing they hit. The fire escape goes "tink", glass taps have the pane's low thump, drips onto the stone sill "plink", and bigger drops on the ground carry a little low-end weight.
+- Inside, the street comes through the glass: low-passed, with a slight boom in the low end, narrowed to a source in front of you. Open the window and it leaks in through the crack. The "window muffle" slider sets how thick the glass sounds.
+- The room has its own small reverb, a radiator that ticks and occasionally hisses or clunks, and the sash scrapes when it moves.
+- City life comes and goes: wet tyres hissing past, the el-train rumbling over its joints, a siren far off, the odd horn, neon buzz and the city's hum. The "city life" slider sets how much. On the residential street you only get the occasional car.
 
-- Drop sizes follow the **Marshall–Palmer** distribution for the current rain rate, and respawned drops are flux-weighted so the population in the air stays correct.
-- Each drop falls at its **terminal velocity** for its size (Atlas et al. 1973).
-- Each drop lags gusts according to its size (drag time τ = v/g), so small drops swirl and big ones keep falling.
-- Gust fronts travel through the rain downwind.
-- Drops are drawn as motion-blurred streaks with energy-conserving brightness, lit by every lamp with a strong forward-scattering lobe. Like real rain, they glow when the light is behind them.
-- Impacts throw up splash droplets (and a central jet on water).
+The look. A "stylise" slider goes from the stage 1 realistic render to a lo-fi painted look: soft painterly smoothing, a warm grade, gentle ink edges, slight banding, paper texture and grain. It's at 0.7 by default.
 
-**Puddle ripples.** A wave-equation simulation on a 10 m tile at 5 mm resolution:
-
-- Every simulated drop that lands in a puddle starts a ripple ring.
-- The countless smaller drops are added at the real physical rate.
-- Beyond the simulated area, statistical ripples take over.
-
-**Fog and sky.** Each lamp's light scattering in the misty air is solved analytically, with falling-rain shimmer inside the glow. The overcast sky is lit orange from below by the town.
-
-**Procedural audio. No samples, all synthesised.**
-
-- The loudest nearby impacts, read back from the GPU simulation, are voiced individually, with a sound that depends on the surface:
-  - water: an impact plus, often, an entrained-air bubble (Minnaert resonance with rising pitch)
-  - wet tarmac and paving: filtered taps plus spray ticks
-  - slate roofs: a ringing tap
-  - soil: a dull thud
-- Every voice is placed in stereo with panning, a tiny interaural delay and head shadow.
-- Distant rain is a statistical "bed" driven by the same rain rate, wind and puddle level, plus a street reverb.
-
-**Background behaviour.** When the window isn't focused it drops to about 30 fps. When it's minimised or hidden it stops rendering, but the rain keeps sounding.
-
-**Living weather.** Rain rate and wind drift slowly, and every so often a heavier shower builds and passes. Turn it off in the panel for steady rain.
+Stage 1 is all still there: the residential street, Marshall–Palmer drop sizes at terminal velocity, wind lag, puddle ripples, lamp fog, and the stage 1 tap and bubble voices.
 
 ## Headless mode (no window)
 
 Useful for making stills or audio clips:
 
 ```bash
-cargo run --release -- --screenshot shot.png --size 2560x1440 --frames 90 --shot 2
-cargo run --release -- --audio rain.wav --seconds 30 --rain 12
+cargo run --release -- --screenshot window.png --size 2560x1440 --frames 90
+cargo run --release -- --screenshot street.png --shot 2 --stylise 0
+cargo run --release -- --audio window.wav --seconds 30 --rain 12 --open
 cargo run --release -- --help
 ```
 
 ## Troubleshooting
 
-- **No sound.** Check that `pipewire-alsa` is installed. The app says "no audio device" in the panel footer if it can't open one.
-- **Black window or crash on start.** Run `RUST_LOG=puddlebun=debug,wgpu=warn cargo run --release` and send me the output.
-- **Low frame rate.** Lower *max drops* and *reflection resolution* under *Quality*.
+- No sound. Check that `pipewire-alsa` is installed. The app says "no audio device" in the panel footer if it can't open one.
+- Black window or crash on start. Run `RUST_LOG=puddlebun=debug,wgpu=warn cargo run --release` and send me the output.
+- Low frame rate. Lower "max drops" and "reflection resolution" under Quality.
 
 ## Project layout
 
@@ -126,8 +107,11 @@ src/
   weather.rs        rain physics (drop sizes, fall speeds, wind, living weather) + tests
   camera.rs         viewpoints, drift and free-fly
   scene.rs          procedural street geometry, lamps, windows
-  render/           GPU: renderer, rain, ripples, bloom/tonemap, readback
-  audio/            synthesiser: voices, distant-rain bed, reverb, output
+  city.rs           the neon street and the room by the window
+  glass.rs          raindrops on the window panes + tests
+  room.rs           the sash, drips, spatter, wet sill
+  render/           GPU: renderer, rain, ripples, glass, post (bloom, tonemap, stylise), readback
+  audio/            synthesiser: voices, rain bed, city life, room sounds, reverbs, output
   headless.rs       offscreen screenshots and audio renders
   shaders/          WGSL: world, street materials, rain, ripples, post
 ```

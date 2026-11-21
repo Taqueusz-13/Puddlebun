@@ -88,7 +88,7 @@ fn gaussian(rng: &mut fastrand::Rng) -> f32 {
 }
 
 /// Everything the renderer and audio need to know about the weather right now.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct WeatherState {
     pub intensity: f32,
     pub wind: Vec3,
@@ -116,7 +116,7 @@ impl Weather {
         Self {
             state: WeatherState {
                 intensity: s.intensity_mm_h,
-                wind: Vec3::ZERO,
+                wind: Vec3::new(s.wind_dir_deg.to_radians().sin(), 0.0, s.wind_dir_deg.to_radians().cos()) * s.wind_speed,
                 gust: 0.0,
                 puddle_level: s.puddle_level,
                 wetness: s.wetness,
