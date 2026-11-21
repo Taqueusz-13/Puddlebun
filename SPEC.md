@@ -123,3 +123,4 @@ Decisions:
 - Glass drops are drawn 1.35× their simulated size (`glass::VIS_SCALE`) so they read on screen. The simulation itself uses real sizes.
 - Audio messages are `AudioMsg::Impact` (with `inside` = in the room, not heard through the glass) and `AudioMsg::Slide`. Audio-only surfaces: `SURF_WOOD` (inner sill), `SURF_STONE` (outer sill).
 - Known for 2b: the city road seen from above looks grey and flat; it needs the puddle work and stronger wet reflections. Street drips from gutters and edges belong with "rain variety".
+- Not done in 2a: the curtain moving when the window is open waits for curtains (room details, stage 4). Rain on car roofs comes with traffic and the parked car.
